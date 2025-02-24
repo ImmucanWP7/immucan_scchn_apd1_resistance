@@ -1,0 +1,318 @@
+---
+title: "IMC_analyses_articleII"
+format: html
+editor: visual
+---
+
+# IMC analyses
+
+## Loading and processing data
+
+```{r output=FALSE}
+#Libraries
+library(readr)
+library(dplyr)
+library(ggpubr)
+library(readxl)
+library(tidyr)
+library(glue)
+
+#Imports
+source("/home/daniel/PaperII_SCCHN/Code/utils.R")
+```
+
+```{r output = FALSE}
+#Data directories
+path_metadata <- "/home/daniel/IMMUCAN/Upstream/Metadata_Clinicaldata"
+path_wes <- "/home/daniel/IMMUCAN/H&N/WES_tables/FinalFilesv2"
+path_IF <- "/home/daniel/IMMUCAN/H&N/IF_tables/FinalTables"
+path_IMC <- "/home/daniel/IMMUCAN/H&N/IMC_tables"
+#Load files
+coldata <- read.csv2(glue("{path_metadata}/IMMUCAN_HN_298_20240821.csv"))
+coldata_samples <- read_csv2(glue("{path_metadata}/coldata_samples_all_SCCHN_20240624.csv"))
+
+mutations <-  read.csv2(glue("{path_wes}/HN_variants_20240805.csv"))
+mutations_type <-  read.csv2(glue("{path_wes}/HN_variants_type_20240805.csv"))
+
+CNV <- read.csv2(glue("{path_wes}/HN_CNVgene_immune_20240819.csv"))
+
+molecular_scores <- read_csv2("/home/daniel/IMMUCAN/H&N/molecular_scores_cnv.csv")
+
+pathways <- read.csv2(glue("{path_wes}/HN_pathways_20240820.csv"))
+
+ICP <- read_csv2(glue("{path_IMC}/IMC1_icp_20240905.csv"))
+tumor <- read_csv2(glue("{path_IMC}/IMC1_tumor_phenotypes_20240807.csv"))
+ICP_lag3 <-read_csv2(glue("{path_IMC}/IMC1_ICP_combined_PD1LAG3_20240905.csv"))
+ICP_VISTA <-read_csv2(glue("{path_IMC}/IMC1_ICP_combined_PDL1VISTA_20240905.csv"))
+
+IF1_p <- read_csv2(glue("{path_IF}/IF1_cell_proportions_all_samples_20210710.csv"))
+IF3_p <- read_csv2(glue("{path_IF}/IF3_cellsproportions_all_samples_20240710.csv"))
+IF2_tumor <- read_csv2(glue("{path_IF}/IF2_tumor_scores_all_samples_20240710.csv"))
+IF2_CD8 <- read_csv2(glue("{path_IF}/IF2_CD8_full_scores_all_samples_20240710.csv"))
+TLS <- read_xlsx("/home/daniel/IMMUCAN/H&N/IF1_TLS.xlsx")
+Immunetype <-  read_csv("/home/daniel/IMMUCAN/H&N/ImmuneType_CD8_IF3_g.csv")
+IF2_CPS <- read_csv2(glue("{path_IF}/IF2_CPS_scores_all_samples.csv"))
+
+RNA <-  read_csv("/home/daniel/IMMUCAN/corrected_normalized_genes.csv") 
+TPM <- read_csv("/home/daniel/IMMUCAN/UPST_SCCHN1_counts_tpm.csv")
+sigs <- read.csv(file="/home/daniel/IMMUCAN/pierre_sigs_gsva.csv") 
+```
+
+```{r}
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0480"] <- "Stable_disease"
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0511"] <- "Stable_disease"
+## "UPST-SCCHN3-0484" progressive disease while secondary resistant, but real, already progression reported at 3 months
+coldata$AntiPD1_benefit[coldata$patient== "UPST-SCCHN3-0484"] <- "No_benefit"
+coldata$AntiPD1_resistance[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+coldata$AntiPD1_resistance_si[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+```
+
+```{r}
+#Preprocess clinical data
+colda <- transform_coldata(coldata)
+
+#Create some clinical variables
+colda <- colda %>%
+  mutate(Pre_antiPD1 = case_when(AntiPD1_timing == "PD1_naive" ~ "No",
+                                 AntiPD1_timing %in% c("PD1_last_treatment", 
+                                                       "PD1_previous_treatment") ~ "No",  
+                                 TRUE ~"Yes"))
+
+colda$AntiPD1_timing <- factor(colda$AntiPD1_timing,
+                               levels= c("PD1_other_next_treatment",
+                                         "PD1_first_next_treatment",
+                                         "PD1_naive",
+                                         "PD1_previous_treatment",
+                                         "PD1_last_treatment"))
+
+colda$AntiPD1_regimen_si[colda$AntiPD1_regimen_si == "Combinaison_chemo_and_ICI_other"] <- "Combinaison_chemo_ICI_other"
+
+#Preprocess samples data
+samples <- transform_sampdata(coldata_samples)
+
+#Filter genomic data
+mutations <- mutations %>% 
+  filter(sample %in% samples$sample) 
+CNV <- CNV %>% 
+  filter(sample %in% samples$sample) 
+molecular_scores <- molecular_scores %>% 
+  filter(sample %in% samples$sample)
+pathways <- pathways %>%
+  filter(sample %in% samples$sample) %>% 
+  left_join(samples %>% select(sample, patient)) 
+
+#Filter IF data
+IF1_p <- IF1_p %>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+IF3_p <- IF3_p %>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+IF2_CD8 <- IF2_CD8%>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+IF2_tumor <- IF2_tumor %>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+TLS <- TLS%>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+Immunetype <- Immunetype %>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+Immunetype_na <- Immunetype %>% filter(is.na(immuneCD8_type_3))
+IF2_CD8 <- IF2_CD8 %>% filter(!sample %in% Immunetype_na$sample)
+
+IF <- colda %>% select(patient, Rbiopsy_FFPE_ID) %>%
+  left_join(IF1_p,by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(IF3_p, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(IF2_CD8, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(IF2_tumor, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(TLS, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(Immunetype, by= c("Rbiopsy_FFPE_ID" ="sample" )) 
+
+
+Immunetype_c <- Immunetype %>% 
+  left_join(colda, by= c("sample" ="Rbiopsy_FFPE_ID" ))
+TLS_c <- TLS %>%
+  left_join(colda, by= c("sample" ="Rbiopsy_FFPE_ID" ))
+colda <- colda %>%
+  mutate(sample= Rbiopsy_FFPE_ID)
+IF_c <- IF %>% 
+  left_join(coldata_samples %>% 
+              select(sample, samptype), 
+            by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(colda)
+
+
+ICP_lag3 <- ICP_lag3 %>% 
+  filter(sample %in% colda$Rbiopsy_FFPE_ID)
+ICP_VISTA <- ICP_VISTA %>% 
+  filter(sample %in% colda$Rbiopsy_FFPE_ID)
+ICP <- ICP%>% 
+  filter(sample %in% colda$Rbiopsy_FFPE_ID)
+tumor <- tumor %>%
+  filter(sample %in% colda$Rbiopsy_FFPE_ID)
+
+tumor_c <- tumor %>% 
+  left_join(colda, by= c("sample" = "Rbiopsy_FFPE_ID"))
+ICP_c <- ICP %>% 
+  left_join(colda, by= c("sample" = "Rbiopsy_FFPE_ID"))
+
+IMC_full <- rbind(tumor %>% select(-c(1, prop_mean)), 
+                  ICP %>% select(-1))
+
+IMC_full_b <- bind_rows(IMC_full, ICP_lag3, ICP_VISTA) %>%
+  select(sample, phenotype, density_mean, n_mean, cell_type, pheno, sum_cell, prop_cell)
+IMC_full_c <- IMC_full %>% left_join(colda, by= c("sample" = "Rbiopsy_FFPE_ID"))
+
+ICP_density <- IMC_full_b %>% 
+  select(sample, phenotype, density_mean) %>% 
+  spread(key= phenotype, value= density_mean)
+ICP_prop_cell <- IMC_full_b %>% 
+  select(sample, phenotype, prop_cell) %>% 
+  spread(key= phenotype, value= prop_cell)
+
+```
+
+## aPD1 treatment/resistance analyses
+
+```{r}
+#Figure 3A) B2M+ expression in tumor cells in aPD1 treatment/resistance
+ICP_l <- ICP_density %>% 
+  gather(key= phenotype, value = density, -sample) %>%
+  left_join(colda , by= c("sample" = "Rbiopsy_FFPE_ID"))
+ICP_l$AntiPD1_res22 <- ICP_l$AntiPD1_res2
+ICP_l$phenotype[ICP_l$phenotype== "Tumor B2M+"] <- "Tumor cells B2M+"
+
+ggplot(ICP_l %>% filter(grepl("Tumor", phenotype) == TRUE &
+                          grepl("B2M", phenotype) == TRUE &
+                          grepl("\\+", phenotype) == TRUE),
+       aes(x= AntiPD1_res22,  y= density, col= AntiPD1_res22)) +
+  geom_boxplot() +
+  facet_wrap(~phenotype, ncol= 4) +
+  stat_compare_means(comparisons = list(c("Anti-PD1\nnaive", "Primary\nresistant"),
+                                        c("Primary\nresistant", "Secondary\nresistant"), 
+                                        c("Anti-PD1\nnaive", "Secondary\nresistant")),
+                     size = 2.8) +
+  theme_bw() +  
+  base_plot_style +
+  theme(legend.position = "none") + 
+  labs(y= "Tumor cells B2M+ / mm²", col= "") +  
+  scale_color_manual(values= c("#619CFF","#fdae61", "#d7191c" )) +
+  ylim(0,9000)
+```
+
+```{r}
+IMC_plot <- function(IMC_df) {
+  fig <- IMC_df %>%
+    ggplot(aes(x= AntiPD1_res22,  y= density, col= AntiPD1_res22)) +
+    geom_boxplot() + 
+    facet_wrap(~phenotype, ncol= 4) +
+    stat_compare_means(comparisons = list(c("N", "1R"),
+                                           c("1R", "2R"), 
+                                           c("N", "2R")), 
+                       size = 2.8) + 
+    theme_bw() +  
+    base_plot_style +
+    theme(legend.position = "none") +  
+    labs( y= "Cells / mm²" , col= "") +  
+    scale_color_manual(values= c("#619CFF","#fdae61", "#d7191c" ))
+  return(fig)
+}
+```
+
+```{r}
+#Figure 4G) Tumor markers in aPD1 treatment/resistance
+ICP_l <- ICP_density %>% 
+  gather(key= phenotype, value = density, -sample) %>% 
+  left_join(colda , by= c("sample" = "Rbiopsy_FFPE_ID"))
+ICP_l$AntiPD1_res22 <- ICP_l$AntiPD1_res2
+levels(ICP_l$AntiPD1_res22) <- c("N", "1R", "2R")
+
+ICP_l$phenotype[ICP_l$phenotype== "Tumor Ido1+"] <- "Tumor cells Ido1+"
+ICP_l$phenotype[ICP_l$phenotype== "Tumor PDL1+"] <- "Tumor cells PDL1+"
+ICP_l$phenotype[ICP_l$phenotype== "Tumor VISTA+"] <- "Tumor cells VISTA+"
+
+tumor_cells <- ICP_l %>% 
+         filter(grepl("Tumor", phenotype) == TRUE & 
+                  grepl("Carbonic|cleaved|Ecad|Ki67|B2M|\\-|PDL1\\+VISTA", phenotype) == FALSE )
+tumor_cells <- IMC_plot(tumor_cells) +
+  ylim(0,6000)
+tumor_cells
+```
+
+```{r}
+#Figure 4F) Macrophage markers in aPD1 treatment/resistance
+Macs <- ICP_l %>%
+  filter(grepl("Mac", phenotype) == TRUE &
+           grepl("\\+", phenotype) == TRUE  & 
+           !phenotype %in% c("MacCD163 PDL1+VISTA+",
+                             "MacCD163 PDL1+VISTA-",
+                             "MacCD163 PDL1-VISTA+", 
+                             "MacCD163 PD1+"))
+
+Macs <- IMC_plot(Macs) +
+  ylim(0,1600)
+
+Macs
+```
+
+```{r}
+#Figure 4I) T-cell LAG3+ expression in aPD1 treatment/resistance (densities)
+ICP_l <- ICP_l %>%
+  mutate(selected_T_cell = grepl("LAG3", phenotype) == TRUE &
+           grepl("PD1", phenotype) == FALSE &
+           grepl("3-", phenotype) == FALSE)
+
+CD8 <- ICP_l %>% 
+  filter(grepl("CD8", phenotype) == TRUE & selected_T_cell) 
+CD8 <- IMC_plot(CD8)
+
+CD4 <- ICP_l %>%
+  filter(grepl("CD4", phenotype) == TRUE & selected_T_cell)
+CD4 <- IMC_plot(CD4)
+
+Treg <- ICP_l %>% 
+  filter(grepl("Treg", phenotype) == TRUE & selected_T_cell)
+Treg <- IMC_plot(Treg)
+
+ggarrange(CD8, CD4, Treg)
+```
+
+```{r}
+IMC_plot2 <- function(IMC_df) {
+  fig <- IMC_df %>%
+    ggplot(aes(x= AntiPD1_res22,  y= prop_cell, col= AntiPD1_res22)) +
+    geom_boxplot() + 
+    facet_wrap(~phenotype, ncol= 4) +
+    stat_compare_means(comparisons = list(c("N", "1R"),
+                                          c("1R", "2R"), 
+                                          c("N", "2R")), 
+                       size = 2.8) + 
+    theme_bw() +  
+    base_plot_style +
+    theme(legend.position = "none") +  
+    labs( y= "Cells / mm²" , col= "") +  
+    scale_color_manual(values= c("#619CFF","#fdae61", "#d7191c" ))
+  return(fig)
+}
+```
+
+```{r}
+#Figure 4J) T-cell LAG3+ expression in aPD1 treatment/resistance (proportions)
+ICP_l <- ICP_prop_cell %>%
+  gather(key= phenotype, value = prop_cell, -sample) %>%
+  left_join(colda , by= c("sample" = "Rbiopsy_FFPE_ID"))
+ICP_l$AntiPD1_res22 <- ICP_l$AntiPD1_res2
+levels(ICP_l$AntiPD1_res22) <- c("N", "1R", "2R")
+
+ICP_l <- ICP_l %>%
+  mutate(selected_T_cell = grepl("LAG3", phenotype) == TRUE &
+           grepl("PD1", phenotype) == FALSE &
+           grepl("3-", phenotype) == FALSE)
+
+CD8 <- ICP_l %>% 
+  filter(grepl("CD8", phenotype) == TRUE & selected_T_cell)
+CD8 <- IMC_plot2(CD8) + 
+  labs( y= "CD8 LAG3+ / total CD8+ T cells (%)" , col= "") 
+CD4 <- ICP_l %>%
+  filter(grepl("CD4", phenotype) == TRUE & selected_T_cell)
+CD4 <- IMC_plot2(CD4) + 
+  labs( y= "CD4 LAG3+ / total CD4+ T cells (%)" , col= "") 
+
+Treg <- ICP_l %>% 
+  filter(grepl("Treg", phenotype) == TRUE & selected_T_cell)
+Treg <- IMC_plot2(Treg) + 
+  labs( y= "Treg LAG3+ / total Treg+ T cells (%)" , col= "") 
+
+ggarrange(CD8, CD4, Treg)
+```

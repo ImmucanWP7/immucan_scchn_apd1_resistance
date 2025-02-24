@@ -1,0 +1,610 @@
+---
+title: "WES_analyses_articleII"
+format: html
+editor: visual
+---
+
+# WES analyses 
+
+## Loading and processing data
+
+```{r}
+#| output: false
+#Libraries
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ComplexHeatmap)
+library(glue)
+
+#Functions
+source("/home/daniel/PaperII_SCCHN/Code/utils.R")
+```
+
+```{r output=FALSE}
+#Data directories
+path_metadata <- "/home/daniel/IMMUCAN/Upstream/Metadata_Clinicaldata"
+path_wes <- "/home/daniel/IMMUCAN/H&N/WES_tables/FinalFilesv2"
+path_IF <- "/home/daniel/IMMUCAN/H&N/IF_tables/FinalTables/"
+
+#Load files
+coldata <- read.csv2(glue("{path_metadata}/IMMUCAN_HN_298_20240821.csv"))
+coldata_samples <- read_csv2(glue("{path_metadata}/coldata_samples_all_SCCHN_20240624.csv"))
+
+mutations <-  read.csv2(glue("{path_wes}/HN_variants_20240805.csv"))
+mutations_type <-  read.csv2(glue("{path_wes}/HN_variants_type_20240805.csv"))
+
+CNV <- read.csv2(glue("{path_wes}/HN_CNVgene_immune_20240819.csv"))
+
+molecular_scores <- read_csv2("/home/daniel/IMMUCAN/H&N/molecular_scores_cnv.csv")
+
+pathways <- read.csv2(glue("{path_wes}/HN_pathways_20240820.csv"))
+```
+
+```{r}
+#Modify some last changes in response
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0480"] <- "Stable_disease"
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0511"] <- "Stable_disease"
+## "UPST-SCCHN3-0484" progressive disease while secondary resistant, but real, already progression reported at 3 months
+coldata$AntiPD1_benefit[coldata$patient== "UPST-SCCHN3-0484"] <- "No_benefit"
+coldata$AntiPD1_resistance[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+coldata$AntiPD1_resistance_si[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+```
+
+```{r}
+#Preprocessing
+colda <- transform_coldata(coldata)
+
+#Transform primary location data
+colda$Prim_diagnosis[colda$Prim_diagnosis == "Oral_cavity"] <- "Oral cavity"
+colda$Prim_diagnosis <- factor(colda$Prim_diagnosis, 
+                               levels = c("Oral cavity", "Oropharynx",
+                                          "Hypopharynx", "Larynx"))
+colda$Prim_diagnosis_HPVstatus <-  factor(colda$Prim_diagnosis_HPVstatus,
+                                          levels = c("Oral_cavity", "Oropharynx_HPV-", 
+                                                     "Oropharynx_HPV+", "Hypopharynx",
+                                                     "Larynx"))
+levels(colda$Prim_diagnosis_HPVstatus) <- c("Oral cavity", "Oropharynx HPV-", 
+                                            "Oropharynx HPV+", "Hypopharynx",
+                                            "Larynx")
+
+
+
+samples <- transform_sampdata(coldata_samples)
+
+#Filter genomic data
+filter_and_select <- function(df, samples_df) {
+  df %>%
+    filter(sample %in% samples_df$sample) %>%
+    select(-sample)
+}
+
+mutations <- filter_and_select(mutations, samples)
+mutations_type <- filter_and_select(mutations_type, samples)
+CNV <- filter_and_select(CNV, samples)
+molecular <- filter_and_select(molecular_scores, samples)
+molecular <- molecular %>% 
+  left_join(samples %>% select(patient, sample))
+pathways <- pathways %>%
+  left_join(samples %>% select(sample, patient))
+pathways <- filter_and_select(pathways, samples)
+```
+
+## Molecular scores & aPD1 treatment/resistance
+
+```{r}
+#Figure S1B-C) 
+#Differences in molecular scores between aPD1 naive-resistant, and primary-secondary resistant 
+mol <- molecular %>% 
+  left_join(colda)
+mol_post <- mol %>%
+  filter(AntiPD1_before_Rbiopsy == "Yes")
+
+tmb1 <- ggplot(mol, aes(x= PD1_res2, y= tmb)) + 
+  geom_boxplot() +  
+  quarto_style + 
+  labs(y= "TMB (mutations/Mb)") +
+  ylim(1,31) +
+  annotate("text", x= 1.5, y = 29.4,
+           label = "multivariate p value=0.46",
+           size = 2.8)
+tmb1
+
+tmb2 <- ggplot(mol_post,aes(x= AntiPD1_res2, y= tmb)) +
+  geom_boxplot() +   
+  quarto_style +
+  labs(y= "TMB (mutations/Mb)") +
+  ylim(1,31) +
+  annotate("text", x= 1.5, y = 29.4,
+           label = "multivariate p value=0.58", 
+           size= 2.8)
+tmb2
+
+CNA1 <- ggplot(mol %>%
+                 filter(grepl("FFT", sample) == TRUE),
+               aes(x= PD1_res2, y= CNA_altered)) + 
+  geom_boxplot() +
+  quarto_style +
+  ylim(0,1) +
+  labs(y= "Fraction genome altered") +
+  annotate("text", x= 1.5, y = 0.95, 
+           label = "multivariate p value=0.12",
+           size= 2.8)
+CNA1
+
+CNA2 <- ggplot(mol_post %>% 
+                 filter(grepl("FFT", sample) == TRUE),
+               aes(x= AntiPD1_res2, y= CNA_altered)) + 
+  geom_boxplot() +
+  quarto_style +
+  ylim(0,1) + 
+  labs(y= "Fraction genome altered") + 
+  annotate("text", x= 1.5, y = 0.95,
+           label = "multivariate p value=0.09", 
+           size= 2.8)
+CNA2
+```
+
+## Oncoplots of aPD1 treatment/resistance
+
+```{r}
+#Retrieve differential genomic features
+get_pvalue_df <- function(data_df, alteration_type, coldata_df) {
+  #Filter/transform genomic data
+  cc<- data_df %>%
+    gather(key= Gene_Name, value= alteration, -patient) %>%
+    filter(alteration!= alteration_type) %>%
+    select(-patient) %>% 
+    unique()
+  #Merge with clinical data
+  gg <- coldata_df %>% 
+    select(patient, PD1_res) %>% 
+    left_join(data_df %>% 
+                select(patient, cc$Gene_Name))
+  #Compute p-values from Fisher test
+  cc$pvalue <- sapply(cc$Gene_Name,
+                    function(x) fisher.test(gg$PD1_res, gg[,x])$p.value)
+  #Create data frame with frequencies per aPD1 category
+  ff <- data_df %>% 
+    gather(key= Gene_Name, value= alteration, -patient) %>%
+    filter(alteration!= alteration_type) %>% 
+    left_join(coldata_df %>% select(patient, PD1_res)) %>% 
+    group_by(PD1_res, Gene_Name) %>% 
+    count() %>% 
+    spread(key= PD1_res, value= n)
+  ff[is.na(ff)] <- 0
+  ff <- ff %>%
+    mutate(Resistant_freq = Resistant /74*100) %>%
+    mutate(AntiPD1_naive_freq = AntiPD1_naive/79*100) %>%
+    mutate(diff_freq = Resistant_freq - AntiPD1_naive_freq)
+  #Add p-values of comparisons
+  ff <- ff %>%
+  left_join(cc %>%
+              filter(!is.na(pvalue)) %>%
+              select(Gene_Name, pvalue))
+  ff <- ff %>%
+    mutate(tot = sum(Resistant, AntiPD1_naive)) %>%
+    mutate(tot_freq = tot/153*100)
+  #Create fancy columns
+  fff <- ff %>% 
+    mutate("antiPD1 resistant n=74" = paste(Resistant, " (",round(Resistant_freq,2), "%)", sep = "")) %>% 
+    mutate("antiPD1 naive n=79" = paste(AntiPD1_naive, " (",round(AntiPD1_naive_freq,2), "%)", sep = "")) %>% 
+    mutate("Total n=153" = paste(tot, " (",round(tot_freq,2), "%)", sep = "")) %>% 
+    mutate("Difference" = paste( round(diff_freq,2), "%", sep = ""))
+  
+  fff <- fff %>%
+    select(Gene_Name, `Total n=153`, 
+           "antiPD1 resistant n=74","antiPD1 naive n=79",
+           Difference, pvalue) %>% 
+    arrange(pvalue)
+  
+  return(list(ff=ff, fff= fff))
+}
+```
+
+```{r}
+#Get p-values of fisher test between aPD1 naive & resistant
+ff_muts <- get_pvalue_df(mutations, "WT", colda)
+ff_cnvs <- get_pvalue_df(CNV, "noCNA", colda)
+ff_paths <- get_pvalue_df(pathways, "noAlteration", colda)
+```
+
+```{r}
+#Select differential mutations between aPD1 naive and resistant
+fff_mut_g <- ff_muts[[2]] %>%
+  filter(pvalue <0.15) %>%
+  #Only more abundant in resistant
+  filter(!grepl("-", Difference)== TRUE)
+
+rownames(mutations_type) <- mutations_type$patient
+#Add specific resistance genes from literature knowledge
+vari <- as.data.frame(t(mutations_type %>%
+                          select(fff_mut_g$Gene_Name, B2M, STK11, KEAP1, LRIG3, H3C12, 
+                                 B2M, JAK2, PTEN, STK11, KEAP1, IRF1, TAP1, ERAP1,
+                                 ERAP2, PSMB10, STAT1, IRF1, NLRC5, NFKB1, APC,TGFBR2, DKK2)))
+
+vari[vari== "WT"] <- NA
+
+#Select differential CNVs between aPD1 naive and resistant
+fff_cnv_g <- ff_cnvs[[2]] %>%
+  filter(pvalue <0.15) %>%
+  #Only specific alterations
+  filter(!(grepl("_del|loss|tot", Gene_Name)== TRUE)) %>%
+  #Only more abundant in resistant
+  filter(!grepl("-", Difference)== TRUE)
+
+rownames(CNV) <- CNV$patient
+#Add specific resistance genes from literature knowledge
+cn <- as.data.frame(t(CNV %>%
+                        select(fff_cnv_g$Gene_Name, B2M_LOH,
+                               PTEN, -B2M, JAK2, TAPBPL))) %>%
+  select(colnames(vari))
+
+cn[cn == "noCNA"] <- NA
+rownames(cn)[rownames(cn)== "B2M_LOH"] <- " B2M"
+rownames(cn)[rownames(cn)== "JAK2"] <- " JAK2"
+rownames(cn)[rownames(cn)== "PTEN"] <- " PTEN"
+
+#Select differential pathways between aPD1 naive and resistant
+fff_pathway_g <- ff_paths[[2]] %>%
+  filter(pvalue <0.05)
+rownames(pathways) <- pathways$patient
+path <- as.data.frame(t(pathways %>%
+            select(fff_pathway_g$Gene_Name))) %>%
+   select(colnames(vari))
+path[path== "noAlteration"] <- NA
+rownames(path)[rownames(path)== "MYC"] <- "MYC "
+
+#Final object with genomic alterations
+var_cnv_g <- rbind(vari, cn, path)
+var_cnv_g[var_cnv_g== "Yes"] <- "Altered"
+
+#Create a data frame with annotations for the oncoplot
+genes <- as.data.frame(rownames(var_cnv_g)) 
+colnames(genes)[1] <- "genes"
+genes <- genes %>% 
+  mutate(gr = case_when( genes %in% rownames(cn) ~ "CNA", 
+                         genes %in% rownames(path) ~ "Pathway", 
+                         TRUE ~ "Mutation")) %>%
+  mutate(gr2 = case_when(genes %in% c(" B2M", " JAK2", " PTEN", "TAPBPL")~"CNA immune",
+                         genes %in% rownames(cn) ~ "CNA frequent", 
+                                         genes %in% rownames(path) ~ "Pathway",
+                         genes %in% fff_mut_g$Gene_Name~"Mutation frequent" ,
+                         TRUE ~ "Mutation immune"))
+genes$gr <- factor(genes$gr, 
+                   levels= c("Mutation", "CNA", "Pathway"))
+genes$gr2 <- factor(genes$gr2,
+                    levels= c("Mutation frequent", "Mutation immune",
+                              "CNA frequent","CNA immune", "Pathway"))
+```
+
+```{r}
+#Colors for oncoplot
+onco_colors  <- list('HPV status' = c("HPV-positive" = "red", 
+                                      "HPV-negative"= "grey"),
+                     "Anti-PD1" = c("Anti-PD1 naive" = "#2c7bb6",
+                                    "Primary resistance" = "#fdae61",
+                                    "Secondary resistance" = "#d7191c"),
+                     "Anti-PD1 benefit after biopsy" = c("Clinical benefit" = "#a1d76a",
+                                                         "No clinical benefit" = "#d01c8b", 
+                                                         "NA" = "white"),
+                     "Number R/M line" = c("0" = "#f1eef6",
+                                           "1" = "#bdc9e1",
+                                           "2" = "#74a9cf",
+                                           "3" = "#2b8cbe",
+                                           ">3" = "#045a8d"), 
+                     "AntiPD1 best response" =c("Complete_response"="#7fc97f",
+                                                "Partial_response" = "#386cb0", 
+                                                "Stable_disease" ="#ffff99",
+                                                "Progressive_disease" = "#bf5b17", 
+                                                "Not_evaluable" = "#d9d9d9", 
+                                                "No antiPD1"= "white"), 
+                     "AntiPD1 regimen" = c("antiPD1"= "#b3cde3",
+                                           "antiPD1+chemotherapy" = "#fbb4ae", 
+                                           "No antiPD1" = "white"))
+
+col_f <-  c(Frameshift = "#ff7f00", "Inframe in_del" = "#377eb8",
+            "Non-sens with NMD" = "#e7298a", "Splice site" = "#ffff33",
+            Missense = "#4daf4a", 'Multi-Hit' = "#984ea3", Promoter= "#a65628", 
+            Deletion = "#034e7b", Amplification = "#e41a1c", LOH = "#91bfdb",
+            Altered= "#999999")
+
+get_grid_rect <- function(class_name) {
+  return(function(x,y,w,h) grid.rect(x, y, w*0.9, h*0.9, 
+                   gp = gpar(fill = col_f[class_name], col = NA)))
+}
+
+#Function to annotate oncoplots with our predefined style
+create_heatmap_annotation <- function(colda, molecular, plot_colors,
+                                      extra_annotations = list(), show_annotation_name = TRUE) {
+  # Create a named list of base annotations
+  base_annotations <- list(
+    'HPV status' = colda$HPV,
+    "Anti-PD1 benefit after biopsy" = colda$Benefit,
+    "Anti-PD1" = colda$AntiPD1_res2
+  )
+  
+  # Merge any extra annotations
+  all_annotations <- c(base_annotations, extra_annotations)
+
+  # Use do.call to pass named arguments dynamically
+  do.call(HeatmapAnnotation, c(
+    all_annotations,
+    list(
+      annotation_name_side = "right",
+      col = plot_colors,
+      gp = gpar(col = "black", fontsize = 8),
+      annotation_name_gp = gpar(fontsize = 8),
+      annotation_legend_param = list(
+        title_gp = gpar(fontsize = 8, fontface = "bold"),
+        labels_gp = gpar(fontsize = 8)
+      ),
+      show_legend = TRUE,
+      show_annotation_name = show_annotation_name,
+      TMB = anno_barplot(
+        molecular$tmb,
+        axis_param = list(gp = gpar(fontsize = 6)),
+        ylim = c(0, 32)
+      ),
+      na_col = "grey"
+    )
+  ))
+}
+```
+
+```{r}
+#Create clinical benefit value from other clinical data
+colda <- colda %>%
+  arrange(patient) %>%
+  mutate(Benefit = case_when(AntiPD1_timing %in% c("PD1_first_next_treatment",
+                                                   "PD1_other_next_treatment") & 
+                               is.na(AntiPD1_benefit) == FALSE ~ AntiPD1_benefit, 
+                             is.na(AntiPD1_benefit) == TRUE ~ as.character("NA"),
+                             TRUE ~as.character("NA")))
+colda$Benefit <- factor(colda$Benefit, 
+                        levels= c("Clinical_benefit", "No_benefit", "NA"))
+levels(colda$Benefit) <- c("Clinical benefit", "No clinical benefit", "NA")
+
+#Transform some clinical values
+colda <- colda %>% mutate(HPV= case_when(HPV_status_temp== "Negative" ~"HPV-negative", 
+                                         HPV_status_temp== "Positive" ~"HPV-positive"))
+colda$AntiPD1_res2 <- factor(colda$AntiPD1_res)
+levels(colda$AntiPD1_res2) <- c("Anti-PD1 naive", "Primary resistance", "Secondary resistance")
+rownames(colda) <- colda$patient
+
+#Modifications needed for HeatmapAnnotation
+rownames(molecular) <- molecular$patient
+molecular <- molecular %>% arrange(patient)
+
+#Split for two oncoprints: naive and resistant
+colda_res <- colda %>% filter(PD1_res == "Resistant")
+colda_naive <- colda %>% filter(PD1_res == "AntiPD1_naive")
+
+molecular_res <- molecular %>% filter(patient %in% colda_res$patient)
+molecular_naive<- molecular %>% filter(patient %in% colda_naive$patient)
+
+#Oncoplot annotation details
+ha_clinical_res <- create_heatmap_annotation(colda_res, molecular_res, onco_colors)
+
+ha_clinical_naive <- create_heatmap_annotation(
+  colda_naive, molecular_naive, onco_colors,
+  extra_annotations = list("AntiPD1 regimen" = colda_naive$PD1_regimen),
+  show_annotation_name = FALSE
+)
+
+#Oncoplots
+ht_alt_res <- oncoPrint(var_cnv_g[,colda_res$patient],
+                        alter_fun = list(background = function(x, y, w, h) {
+                          grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+                                    gp = gpar(fill = "#f0f0f0", col = NA))},
+                          Frameshift = get_grid_rect("Frameshift"),  
+                          "Inframe in_del" = get_grid_rect("Inframe in_del"),
+                          Missense = get_grid_rect("Missense"),
+                          "Non-sens with NMD" = get_grid_rect("Non-sens with NMD"),
+                          "Splice site" = get_grid_rect("Splice site"),
+                          "Promoter" = get_grid_rect("Promoter"),
+                          'Multi-Hit' = get_grid_rect("Multi-Hit"),
+                          Deletion = get_grid_rect("Deletion"), 
+                          Loss = get_grid_rect("Loss"),
+                          Amplification = get_grid_rect("Amplification"),  
+                          LOH = get_grid_rect("LOH"),
+                          Altered = get_grid_rect("Altered")),
+                        col = col_f,
+                        right_annotation = NULL,
+                        row_names_side = "left",
+                        pct_side = "right",
+                        row_title = c("Variants", "CNA", "Pathway"),
+                        row_title_side = "left", 
+                        show_column_names = FALSE, 
+                        row_title_gp = gpar(fontsize = 10), 
+                        border = TRUE, row_names_gp = gpar(fontsize = 6),
+                        pct_gp = gpar(fontsize = 6), 
+                        heatmap_legend_param = 
+                          list(title = "Alteration", 
+                               title_gp = gpar(fontsize = 8, fontface = "bold")),
+                        top_annotation = ha_clinical_res,
+                        row_split = genes$gr,
+                        column_split = colda_res$AntiPD1_res2, 
+                        column_title = c("            Anti-PD1 resistant cohort", ""), 
+                        column_title_gp = gpar( fontface = "bold", fontsize=10),)
+
+
+oo <- row_order(ht_alt_res)
+
+ht_alt_naive <- oncoPrint(var_cnv_g[,colda_naive$patient],
+                          alter_fun = list(
+                            background = function(x, y, w, h) {
+                              grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+                                        gp = gpar(fill = "#f0f0f0", col = NA))},
+                            Frameshift = get_grid_rect("Frameshift"),  
+                            "Inframe in_del" = get_grid_rect("Inframe in_del"),
+                            Missense = get_grid_rect("Missense"),
+                            "Non-sens with NMD" = get_grid_rect("Non-sens with NMD"),
+                            "Splice site" = get_grid_rect("Splice site"),
+                            "Promoter" = get_grid_rect("Promoter"),
+                            'Multi-Hit' = get_grid_rect("Multi-Hit"),
+                            Deletion = get_grid_rect("Deletion"), 
+                            Loss = get_grid_rect("Loss"),
+                            Amplification = get_grid_rect("Amplification"),  
+                            LOH = get_grid_rect("LOH"),
+                            Altered = get_grid_rect("Altered")), 
+                          col = col_f,
+                          right_annotation = NULL,
+                          row_names_side = "left",
+                          pct_side = "right", 
+                          row_title = c("Variants more frequent\nin anti-PD1 resistant",
+                                        "Immune related\nvariants",
+                                        "CNA more frequent\nin anti-PD1 resistant",
+                                        "Immune related\nCNA",
+                                        "Pathway more frequently\naltered in anti-PD1 resistant"),
+                          row_title_side = "left", 
+                          show_column_names = FALSE, 
+                          show_row_names = TRUE, 
+                          row_order = c(oo$Mutation, oo$CNA, oo$Pathway),
+                          row_title_gp = gpar(fontsize = 10), 
+                          row_title_rot=0, 
+                          border = TRUE,
+                          row_names_gp = gpar(fontsize = 6),
+                          pct_gp = gpar(fontsize = 6), 
+                          heatmap_legend_param = 
+                            list(title = "Alteration",
+                                 title_gp = gpar(fontsize = 8, fontface = "bold")),
+                          top_annotation = ha_clinical_naive, 
+                          row_split = genes$gr2, 
+                          show_heatmap_legend= FALSE,
+                          column_title_gp = gpar( fontface = "bold", fontsize=10),
+                          column_title= "Anti-PD1 naïve cohort")
+
+draw(ht_alt_naive + ht_alt_res, merge_legend = TRUE)
+```
+
+```{r}
+#Select frequent variants in whole cohort
+fff_mut_g <- ff_muts[[1]] %>% 
+  filter(Resistant_freq > 6 | AntiPD1_naive_freq > 6)
+#Transform data frame
+rownames(mutations_type) <- mutations_type$patient
+vari <- as.data.frame(t(mutations_type %>%
+                          select(fff_mut_g$Gene_Name)))
+vari[vari== "WT"] <- NA
+
+#Select frequent CNVs in whole cohort
+fff_cnv_g <- ff_cnvs[[1]] %>%
+  filter(Resistant_freq > 6 | AntiPD1_naive_freq > 6) %>%
+  filter(!(grepl("_del|loss|tot|HLA|LOH", Gene_Name) == TRUE))
+
+#Transform data frame
+rownames(CNV) <- CNV$patient
+cn <- as.data.frame(t(CNV %>% 
+                        select(fff_cnv_g$Gene_Name,
+                               -c(FGF19, FGF4, CCND1, B2M)))) %>%
+  select(colnames(vari))
+cn[cn == "noCNA"] <- NA
+
+#Specific changes to data frames
+rownames(cn)[rownames(cn)== "FGF3"] <- "11q13.3"
+rownames(vari)[rownames(vari)== "CDKN2A"] <- " CDKN2A"
+rownames(vari)[rownames(vari)== "FAT1"] <- " FAT1"
+
+var_cnv_g <- rbind(vari, cn)
+
+#Select genes for oncoplot
+genes <- as.data.frame(rownames(var_cnv_g)) 
+colnames(genes)[1] <- "genes"
+genes <- genes %>% 
+  mutate(gr = case_when(genes %in% rownames(cn) ~ "CNA",
+                        TRUE ~ "Mutation"))
+
+genes$gr <- factor(genes$gr,
+                   levels= c("Mutation", "CNA"))
+
+```
+
+```{r}
+#Oncoplot annotation details
+ha_clinical_res <- create_heatmap_annotation(colda_res, molecular_res, onco_colors)
+
+ha_clinical_naive <- create_heatmap_annotation(
+  colda_naive, molecular_naive, onco_colors,
+  extra_annotations = list("AntiPD1 regimen" = colda_naive$PD1_regimen),
+  show_annotation_name = FALSE
+)
+
+#Oncoplots
+ht_alt_naive <- oncoPrint(var_cnv_g[,colda_naive$patient],
+                          alter_fun = list(background = function(x, y, w, h) {
+                            grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+                                      gp = gpar(fill = "#f0f0f0", col = NA))},
+                            Frameshift = get_grid_rect("Frameshift"),  
+                            "Inframe in_del" = get_grid_rect("Inframe in_del"),
+                            Missense = get_grid_rect("Missense"),
+                            "Non-sens with NMD" = get_grid_rect("Non-sens with NMD"),
+                            "Splice site" = get_grid_rect("Splice site"),
+                            "Promoter" = get_grid_rect("Promoter"),
+                            'Multi-Hit' = get_grid_rect("Multi-Hit"),
+                            Deletion = get_grid_rect("Deletion"), 
+                            Loss = get_grid_rect("Loss"),
+                            Amplification = get_grid_rect("Amplification"),  
+                            LOH = get_grid_rect("LOH"),
+                            Altered = get_grid_rect("Altered")), 
+                          col = col_f, right_annotation = NULL,
+                          row_names_side = "left",
+                          pct_side = "right",
+                          row_title = c("Variants", "CNA"),
+                          row_title_side = "left",
+                          show_column_names = FALSE, 
+                          show_row_names = TRUE,
+                          row_title_gp = gpar(fontsize = 10), 
+                          border = TRUE, 
+                          row_names_gp = gpar(fontsize = 6),
+                          pct_gp = gpar(fontsize = 6), 
+                          heatmap_legend_param = list(title = "Alteration", 
+                                                      title_gp = gpar(fontsize = 8,
+                                                                      fontface = "bold")),
+                          top_annotation = ha_clinical_naive, 
+                          row_split = genes$gr,
+                          show_heatmap_legend= FALSE, 
+                          column_title_gp = gpar( fontface = "bold", fontsize=10),
+                          column_title= "Anti-PD1 naïve cohort")
+
+
+
+ht_alt_res <- oncoPrint(var_cnv_g[,colda_res$patient],
+                        alter_fun = list(background = function(x, y, w, h) {
+                          grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+                                    gp = gpar(fill = "#f0f0f0", col = NA))},
+                          Frameshift = get_grid_rect("Frameshift"),  
+                          "Inframe in_del" = get_grid_rect("Inframe in_del"),
+                          Missense = get_grid_rect("Missense"),
+                          "Non-sens with NMD" = get_grid_rect("Non-sens with NMD"),
+                          "Splice site" = get_grid_rect("Splice site"),
+                          "Promoter" = get_grid_rect("Promoter"),
+                          'Multi-Hit' = get_grid_rect("Multi-Hit"),
+                          Deletion = get_grid_rect("Deletion"), 
+                          Loss = get_grid_rect("Loss"),
+                          Amplification = get_grid_rect("Amplification"),  
+                          LOH = get_grid_rect("LOH"),
+                          Altered = get_grid_rect("Altered")),
+                        col = col_f,
+                        right_annotation = NULL,
+                        row_names_side = "left",
+                        pct_side = "right", 
+                        row_title = c("Variants", "CNA"),
+                        row_title_side = "left",
+                        show_column_names = FALSE,
+                        row_title_gp = gpar(fontsize = 10), 
+                        border = TRUE, 
+                        row_names_gp = gpar(fontsize = 6),
+                        pct_gp = gpar(fontsize = 6), 
+                        heatmap_legend_param = list(title = "Alteration",
+                                                    title_gp = gpar(fontsize = 8,
+                                                                    fontface = "bold" )), 
+                        top_annotation = ha_clinical_res,
+                        row_split = genes$gr,
+                        column_split = colda_res$AntiPD1_res2,
+                        column_title = c("            Anti-PD1 resistant cohort", ""), 
+                        column_title_gp = gpar( fontface = "bold", fontsize=10))
+
+draw(ht_alt_naive + ht_alt_res, merge_legend = TRUE)
+```

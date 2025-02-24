@@ -1,0 +1,1428 @@
+---
+title: "IMC_B2M_analyses_articleII"
+format: html
+editor: visual
+---
+
+# IMC/B2M analyses
+
+## Loading and processing data
+
+```{r output = FALSE}
+#Libraries
+library(readr)
+library(survival)
+library(survminer)
+library(forestmodel)
+library(dplyr)
+library(ggpubr)
+library(readxl)
+library(tidyr)
+library(glue)
+
+#Functions
+source("/home/daniel/PaperII_SCCHN/Code/utils.R")
+```
+
+```{r}
+#General definitions
+#Cell types of interest
+IF1_cell_types_int <- c( "B cells", "BnT cells",
+                         "DC", "MacCD163+",
+                         "Neutrophils", "T cells")
+IF3_cell_types_int <- c("CD4+CD8+Tcells", "CD4+Tcells",
+                        "CD8+Tcells", "NK", "NKT",
+                        "Tregs")
+#Levels for factors whenever needed
+IF1_cell_levels <- c( "B cells", "BnT cells",
+                      "DC", "MacCD163+",
+                      "Neutrophils", "other_totalR",
+                      "T cells", "Tumor_tumorR")
+IF3_cell_levels <- c("CD4+CD8+Tcells", "CD4+Tcells",   
+                     "CD8+Tcells", "NK", "NKT",
+                     "other_totalR", "Tother", 
+                     "Tregs", "Tumor_tumorR" )
+```
+
+```{r output = FALSE}
+#Data directories
+path_metadata <- "/home/daniel/IMMUCAN/Upstream/Metadata_Clinicaldata"
+path_wes <- "/home/daniel/IMMUCAN/H&N/WES_tables/FinalFilesv2"
+path_IF <- "/home/daniel/IMMUCAN/H&N/IF_tables/FinalTables"
+path_IMC <- "/home/daniel/IMMUCAN/H&N/IMC_tables"
+
+#Load files
+coldata <- read.csv2(glue("{path_metadata}/IMMUCAN_HN_298_20240912.csv"))
+coldata_samples <- read_csv2(glue("{path_metadata}/coldata_samples_all_SCCHN_20240624.csv"))
+
+mutations <-  read.csv2(glue("{path_wes}/HN_variants_20240805.csv"))
+mutations_type <-  read.csv2(glue("{path_wes}/HN_variants_type_20240805.csv"))
+
+CNV <- read.csv2(glue("{path_wes}/HN_CNVgene_immune_20240819.csv"))
+
+molecular_scores <- read_csv2("/home/daniel/IMMUCAN/H&N/molecular_scores_cnv.csv")
+
+pathways <- read.csv2(glue("{path_wes}/HN_pathways_20240820.csv"))
+
+ICP <- read_csv2(glue("{path_IMC}/IMC1_icp_20240905.csv"))
+tumor <- read_csv2(glue("{path_IMC}/IMC1_tumor_phenotypes_20240807.csv"))
+
+IF1_p <- read_csv2(glue("{path_IF}/IF1_cell_proportions_all_samples_20210710.csv"))
+IF3_p <- read_csv2(glue("{path_IF}/IF3_cellsproportions_all_samples_20240710.csv"))
+IF2_tumor <- read_csv2(glue("{path_IF}/IF2_tumor_scores_all_samples_20240710.csv"))
+IF2_CD8 <- read_csv2(glue("{path_IF}/IF2_CD8_full_scores_all_samples_20240710.csv"))
+TLS <- read_xlsx("/home/daniel/IMMUCAN/H&N/IF1_TLS.xlsx")
+Immunetype <-  read_csv("/home/daniel/IMMUCAN/H&N/ImmuneType_CD8_IF3_g.csv")
+IF2_CPS <- read_csv2(glue("{path_IF}/IF2_CPS_scores_all_samples.csv"))
+
+RNA <-  read_csv("/home/daniel/IMMUCAN/corrected_normalized_genes.csv") 
+TPM <- read_csv("/home/daniel/IMMUCAN/UPST_SCCHN1_counts_tpm.csv")
+sigs <- read.csv(file="/home/daniel/IMMUCAN/pierre_sigs_gsva_a.csv") 
+```
+
+```{r}
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0480"] <- "Stable_disease"
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0511"] <- "Stable_disease"
+## "UPST-SCCHN3-0484" progressive disease while secondary resistant, but real, already progression reported at 3 months
+coldata$AntiPD1_benefit[coldata$patient== "UPST-SCCHN3-0484"] <- "No_benefit"
+coldata$AntiPD1_resistance[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+coldata$AntiPD1_resistance_si[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+```
+
+```{r}
+#Preprocess clinical data
+colda <- transform_coldata(coldata)
+
+#Create some clinical variables
+colda <- colda %>% 
+  mutate(PD1_responder = case_when(AntiPD1_response %in% c("Partial_response",
+                                                           "Complete_response") ~ "Responder", 
+                                   AntiPD1_response %in% c("Stable_disease",
+                                                           "Progressive_disease") ~ "Non_responder"))
+
+colda <- colda %>% 
+  mutate(AntiPD1_regimen_bi = case_when(AntiPD1_regimen_si %in% c("Combinaison_ICI_other",
+                                                                  "Monotherapy") ~ "ICI", 
+                                                           AntiPD1_regimen_si %in% c("Combinaison_chemo_ICI_other", "Combinaison_chemo", "Combinaison_chemo_and_ICI_other") ~ "ICI with chemo" ))
+
+colda$ECOG_si[is.na(colda$ECOG_si)] <- 1
+
+
+colda$AntiPD1_timing <- factor(colda$AntiPD1_timing, 
+                               levels= c("PD1_other_next_treatment",
+                                         "PD1_first_next_treatment",
+                                         "PD1_naive","PD1_previous_treatment",
+                                         "PD1_last_treatment" ))
+
+colda$AntiPD1_regimen_si[colda$AntiPD1_regimen_si== "Combinaison_chemo_and_ICI_other"] <- "Combinaison_chemo_ICI_other"
+
+#Preprocess samples data
+samples <- transform_sampdata(coldata_samples)
+
+#Filter genomic data
+mutations <- mutations %>% 
+  filter(sample %in% samples$sample) 
+CNV <- CNV %>% 
+  filter(sample %in% samples$sample) 
+molecular_scores <- molecular_scores %>% 
+  filter(sample %in% samples$sample)
+pathways <- pathways %>%
+  filter(sample %in% samples$sample) %>% 
+  left_join(samples %>% select(sample, patient)) 
+
+#Filter IF data
+IF_filter <- function(df, colda_df) {
+  df %>%
+    filter(sample %in% colda_df$Rbiopsy_FFPE_ID) %>%
+    left_join(colda_df  %>% select(Rbiopsy_FFPE_ID, patient),
+            by= c("sample" = "Rbiopsy_FFPE_ID")) 
+}
+
+IF1_p <- IF_filter(IF1_p, colda) 
+IF3_p <- IF_filter(IF3_p, colda) 
+IF2_CD8 <- IF_filter(IF2_CD8, colda) 
+IF2_tumor <- IF_filter(IF2_tumor, colda) 
+
+TLS <- TLS%>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+Immunetype <- Immunetype %>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+Immunetype_na <- Immunetype %>% filter(is.na(immuneCD8_type_3))
+IF2_CD8 <- IF2_CD8 %>% filter(!sample %in% Immunetype_na$sample)
+IF2_CPS <- IF2_CPS %>% filter(sample %in% colda$Rbiopsy_FFPE_ID)
+
+IF <- colda %>%
+  select(patient, Rbiopsy_FFPE_ID) %>%
+  left_join(IF1_p,by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(IF3_p, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(IF2_CD8, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(IF2_tumor, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(TLS, by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(Immunetype, by= c("Rbiopsy_FFPE_ID" ="sample" )) 
+
+Immunetype_c <- Immunetype %>%
+  left_join(colda, by= c("sample" ="Rbiopsy_FFPE_ID" ))
+TLS_c <- TLS %>%
+  left_join(colda, by= c("sample" ="Rbiopsy_FFPE_ID" ))
+colda <- colda %>%
+  mutate(sample= Rbiopsy_FFPE_ID)
+
+IF_c <- IF %>%
+  left_join(coldata_samples %>% 
+              select(sample, samptype),
+            by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(colda)
+
+#Filter IMC data
+ICP <- ICP %>% 
+  filter(sample %in% colda$Rbiopsy_FFPE_ID)
+ICP$prop_cell[is.na(ICP$prop_cell)] <- 0
+tumor <- tumor %>% 
+  filter(sample %in% colda$Rbiopsy_FFPE_ID)
+
+tumor_c <- tumor %>%
+  left_join(colda, by= c("sample" = "Rbiopsy_FFPE_ID"))
+ICP_c <- ICP %>%
+  left_join(colda, by= c("sample" = "Rbiopsy_FFPE_ID"))
+
+IMC_full <- rbind(tumor[,-6], ICP)
+IMC_full_c <- IMC_full %>%
+  left_join(colda, by= c("sample" = "Rbiopsy_FFPE_ID"))
+
+IMC_density <- IMC_full %>% 
+  select(sample, phenotype, density_mean) %>%
+  spread(key= phenotype, value= density_mean)
+IMC_density <- IMC_density %>% 
+  left_join(colda %>% select(Rbiopsy_FFPE_ID, patient),
+            by= c("sample" = "Rbiopsy_FFPE_ID"))
+
+#Filter RNAseq data 
+colnames(TPM)[1] <- "gene"
+TPM <- TPM %>% 
+  gather(key= sample, value= expression, -gene) %>% 
+  spread(key= gene, value= expression) %>%
+  filter(sample %in% samples$sample) %>% 
+  left_join(samples %>% select(sample, patient))
+
+colnames(RNA)[1] <- "gene"
+RNA <- RNA %>% 
+  gather(key= sample, value = expression, -gene) %>% 
+  spread(key= gene, value= expression) %>%
+  filter(sample %in% samples$sample)%>%
+  left_join(samples %>% select(sample, patient))
+
+sigs <- sigs %>%
+  filter(X %in% samples$sample) %>%
+  left_join(samples %>%
+              select(sample, patient), by= c("X"= "sample")) 
+
+colnames(CNV) <- paste(colnames(CNV), "CNV", sep =  "_")
+colnames(CNV)[1] <- "sample"
+CNV <- CNV %>% left_join(samples %>% select(sample, patient))
+colnames(mutations) <- paste(colnames(mutations), "mut", sep = "_")
+colnames(mutations)[1] <- "sample"
+mutations <- mutations %>% left_join(samples %>% select(sample, patient))
+
+colnames(pathways) <- paste(colnames(pathways), "pathway", sep =  "_")
+colnames(pathways)[1] <- "sample"
+colnames(pathways)[17] <- "patient"
+```
+
+## B2M RNA/DNA analyses
+
+```{r}
+#Figure S2A) B2M RNA expression according to genomic status
+RR <- RNA %>% select(sample, B2M) %>% 
+  left_join(CNV %>% select(B2M_CNV, sample, B2M_LOH_CNV,B2M_tot_CNV, MYC_CNV)) %>%
+  left_join(mutations %>% select(sample, B2M_mut)) %>% 
+  mutate(B2M_tt = case_when(B2M_mut== "SNV" & B2M_tot_CNV == "LOH" ~"LOH neutral + SNV", 
+                            B2M_mut== "SNV" & B2M_tot_CNV == "Loss" ~"LOH loss\n+ SNV", 
+                            B2M_tot_CNV == "LOH" ~"LOH neutral",
+                            B2M_tot_CNV == "Loss" ~"LOH loss", 
+                            B2M_tot_CNV == "noCNA" ~"WT",
+                            TRUE ~B2M_tot_CNV))
+
+ggplot(RR, aes(x= B2M_tt, y= B2M)) + 
+  geom_boxplot() + 
+  stat_compare_means() +
+  geom_point() +   
+  theme_bw() +  
+  base_plot_style +
+  labs(y= "mRNA B2M expression (normalized)", col= "")
+
+
+TT <- TPM %>% 
+  select(sample, B2M) %>%
+  left_join(CNV %>%
+              select(B2M_CNV, sample,
+                     B2M_LOH_CNV,
+                     B2M_tot_CNV, MYC_CNV)) %>%
+  left_join(mutations %>%
+              select(sample, B2M_mut)) %>%
+  mutate(B2M_tt = case_when(B2M_mut== "SNV" &
+                              B2M_tot_CNV == "LOH" ~"LOH neutral + SNV", 
+                            B2M_mut== "SNV" & 
+                              B2M_tot_CNV == "Loss" ~"LOH loss\n+ SNV", 
+                            B2M_tot_CNV == "LOH" ~"LOH neutral",
+                            B2M_tot_CNV == "Loss" ~"LOH loss", 
+                            B2M_tot_CNV == "noCNA" ~"WT", 
+                            TRUE ~ B2M_tot_CNV))
+
+
+TT$B2M_tt <- factor(TT$B2M_tt,
+                    levels= c("Deletion",
+                              "LOH loss\n+ SNV",
+                              "LOH loss",
+                              "LOH neutral", 
+                              "WT"))
+ggplot(TT, aes(x= B2M_tt, y= log10(B2M+1))) + 
+  geom_boxplot() +
+  geom_point() + 
+  theme_bw() +
+  base_plot_style +
+  labs(y= "mRNA B2M expression (log10(TPM+1))", 
+       x= "B2M alterations", col= "") 
+
+```
+
+```{r}
+b2mpos <- tumor %>%
+  filter(phenotype == "Tumor B2M+")  %>%
+  left_join(coldata_samples %>%
+              select(sample, patient)) %>%
+  left_join(colda %>%
+              select(-sample)) %>%
+  left_join(
+    CNV %>% select(
+      patient,
+      B2M_LOH_CNV,
+      PTEN_CNV,
+      MDM2_CNV,
+      HLA.A_CNV,
+      HLA.B_CNV,
+      HLA.C_CNV,
+      FAT1_CNV,
+      MYCL_CNV,
+      MYC_CNV,
+      JAK2_CNV,
+      B2M_tot_CNV,
+      PTEN_CNV,
+      HLA.A_LOH_CNV,
+      HLA.B_LOH_CNV,
+      EGFR_CNV,
+      HLA.C_LOH_CNV
+    )
+  ) %>% left_join(
+    mutations %>% select(
+      patient,
+      PIK3CA_mut,
+      JAK2_mut,
+      B2M_mut,
+      IRF1_mut,
+      NLRC5_mut,
+      ERAP1_mut,
+      ERAP2_mut,
+      PSMB10_mut,
+      PSMB7_mut,
+      TAP1_mut,
+      TAP2_mut,
+      STAT1_mut,
+      MAP3K1_mut,
+      NFKBIA_mut,
+      NFKB2_mut,
+      NFKB1_mut
+    )
+  ) %>% 
+  mutate(
+    B2M_tot = case_when(
+      B2M_LOH_CNV == "LOH" & B2M_mut == "SNV" ~ "LOH + SNV",
+      B2M_LOH_CNV == "noCNA" ~ "WT",
+      TRUE ~ B2M_LOH_CNV
+    )
+  ) %>%
+  left_join(samples %>%
+              select(patient, samptype, specimen_type)) %>%
+  left_join(pathways %>% select(patient, MYC_pathway)) %>%
+  mutate(
+    alt_B2M = case_when(
+      IRF1_mut == "SNV" ~ "IRF1 SNV",
+      PSMB10_mut == "SNV" ~ "PSMB10 SNV",
+      STAT1_mut == "SNV" ~ "STAT1 SNV",
+      JAK2_mut == "SNV" ~ "JAK2 SNV",
+      JAK2_CNV == "Amplification" ~ "JAK2 amplification",
+      STAT1_mut == "SNV" ~ "STAT1 SNV",
+      ERAP2_mut == "SNV" ~ "ERAP2 SNV",
+      ERAP1_mut == "SNV" ~ "ERAP1 SNV",
+      NLRC5_mut == "SNV" ~ "NLRC5 SNV",
+      MYC_CNV == "Amplification" ~ "MYC amplification",
+      MYCL_CNV == "Amplification" ~ "MYCL amplification"
+    )
+  ) %>%
+  mutate(
+    alt_ss = case_when(
+      PSMB10_mut == "SNV" ~ "PSMB10 SNV",
+      JAK2_CNV == "Amplification" ~ "JAK2 amplification",
+      STAT1_mut == "SNV" ~ "STAT1 SNV",
+      ERAP1_mut == "SNV" ~ "ERAP1 SNV",
+      ERAP2_mut == "SNV" ~ "ERAP2 SNV",
+      NLRC5_mut == "SNV" ~ "NLRC5 SNV"
+    )
+  ) %>%
+  mutate(
+    alt_hla_ss = case_when(
+      HLA.A_LOH_CNV == "LOH" &
+        HLA.B_LOH_CNV == "LOH" &
+        HLA.C_LOH_CNV == "LOH" ~ "HLA-A/B/C LOH",
+      HLA.A_LOH_CNV == "LOH" |
+        HLA.B_LOH_CNV == "LOH" |
+        HLA.C_LOH_CNV == "LOH" ~ "HLA-A or B or C LOH"
+    )
+  ) %>%
+  mutate(
+    alt_g = case_when(
+      IRF1_mut == "SNV" ~ "IRF1 SNV",
+      JAK2_mut == "SNV" ~ "JAK2 SNV",
+      NFKB1_mut == "SNV" ~ "NFKB1 SNV"
+    )
+  ) %>%
+  mutate(
+    B2M_tt = case_when(
+      B2M_mut == "SNV" &
+        B2M_tot_CNV == "LOH" ~ "LOH neutral + SNV",
+      B2M_mut == "SNV" &
+        B2M_tot_CNV == "Loss" ~ "LOH loss\n+ SNV",
+      B2M_tot_CNV == "LOH" ~ "LOH neutral",
+      B2M_tot_CNV == "Loss" ~ "LOH loss",
+      B2M_tot_CNV == "noCNA" ~ "WT",
+      TRUE ~ B2M_tot_CNV
+    )
+  )
+
+b2mpos$B2M_tt <- factor(b2mpos$B2M_tt,
+                        levels = c("Deletion", "LOH loss\n+ SNV", "LOH loss", "LOH neutral", "WT"))
+```
+
+```{r}
+#Figure S2B) Specific LOH combination according to genomic LOH
+p1 <- ggplot(b2mpos, aes(x = B2M_tt, y = prop_cell)) +
+  geom_boxplot() + geom_point(alpha = 0.2) +
+  theme_bw() +
+  base_plot_style +
+  theme(legend.title = element_blank()) +
+  labs(y = "Tumor cells B2M+ / total tumor cells (%)" , x = "B2M alterations")
+p1 + geom_point(data = b2mpos %>%
+                  filter(!is.na(alt_hla_ss)),
+                aes(col = alt_hla_ss),
+                size = 2)
+
+#Figure S2C) Literature aPD1 resistance mutations according to genomic LOH
+p1 <- ggplot(b2mpos, aes(x = B2M_tt, y = prop_cell)) +
+  geom_boxplot() +
+  geom_point(alpha = 0.2) +
+  theme_bw() +
+  base_plot_style +
+  theme(legend.title = element_blank()) +
+  labs(y = "Tumor cells B2M+ / total tumor cells (%)", x = "B2M alterations")
+p1 + geom_point(data = b2mpos %>%
+                  filter(!is.na(alt_ss)),
+                aes(col = alt_ss),
+                size = 2)
+
+#Figure 3A) Literature aPD1 resistance mutations according to genomic LOH
+p1 <- ggplot(b2mpos, aes(x = B2M_tt, y = prop_cell)) +
+  geom_boxplot() +
+  geom_point(alpha = 0.2) +
+  theme_bw() +
+  base_plot_style +
+  theme(legend.title = element_blank()) +
+  labs(y = "Tumor cells B2M+ / total tumor cells (%)", x = "B2M alterations")
+p1 + geom_point(data = b2mpos %>%
+                  filter(!is.na(alt_g)),
+                aes(col = alt_g),
+                size = 2.5)
+```
+
+```{r}
+#Figure S2F) Distribution of B2M+ tumor cells in all patients
+tumor_c %>% 
+  filter(phenotype == "Tumor B2M+") %>%
+  ggplot(aes(prop_cell)) + 
+  geom_histogram() + 
+  theme_bw(base_size = 24) + 
+  xlab("Tumor cells B2M+ / total tumor cells (%)")
+```
+
+## B2M IF analyses
+
+```{r}
+bp <- tumor %>% filter(phenotype == "Tumor B2M+") %>%
+  left_join(colda, by = c("sample" = "Rbiopsy_FFPE_ID")) %>%
+  mutate(B2M_IMC20 = case_when(prop_cell < 20 ~ "B2M-low", TRUE ~ "B2M-high")) 
+
+bp$B2M_IMC20 <- factor(bp$B2M_IMC20, levels = c("B2M-low", "B2M-high"))
+
+bp_pre <- bp %>% 
+  filter(AntiPD1_timing == "PD1_first_next_treatment")
+bp_pro <- bp %>%
+  filter(AntiPD1_timing %in% c("PD1_first_next_treatment", 
+                               "PD1_other_next_treatment"))
+```
+
+```{r}
+#Figure 3C-D) IF populations according to B2M-low/high status
+IF1_l <- IF1_p %>% 
+  select(-sample) %>%
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("tumor", celltype)== TRUE) %>%  
+  left_join(bp %>% select(patient, B2M_IMC20))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <- IF1_cell_levels
+
+IF1_B2M_tumor <- IF1_l %>%
+  filter(!is.na(B2M_IMC20)) %>%
+  filter(celltype %in% IF1_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= B2M_IMC20)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") +
+  theme_bw() + 
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(size=8), 
+        axis.title.y = element_text(size= 10),
+        axis.text.y = element_text(size= 8), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8),
+        legend.position = c(0.2,0.7)) + 
+  theme(plot.title = element_text(hjust = 0.5, size= 10)) + 
+  scale_color_manual(values = c("#377eb8", "#e41a1c")) +
+  annotate("text", x= 1, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 2, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 3, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 4, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 5, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 6, y = 40, label = "p=0.0008", size= 2.8)
+
+
+IF1_l <- IF1_p %>% 
+  select(-sample) %>% 
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("stroma", celltype) == TRUE) %>%
+  left_join(bp %>% select(patient, B2M_IMC20))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <-IF1_cell_levels
+
+IF1_B2M_stroma <- IF1_l %>%
+  filter(!is.na(B2M_IMC20)) %>%
+  filter(celltype %in% IF1_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= B2M_IMC20)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  theme_bw() + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_text(size=8), 
+        axis.title.y = element_text(size= 10), 
+        axis.text.y = element_text(size= 8),
+        plot.title = element_text(size = 10), 
+        legend.title = element_text(size = 10), 
+        legend.text = element_text(size = 8),
+        legend.position = c(0.2,0.7)) + 
+  theme(plot.title = element_text(hjust = 0.5, size= 10)) +
+  scale_color_manual(values=c("#377eb8", "#e41a1c")) +
+  annotate("text", x= 1, y = 58, label = "ns", size= 2.8) +
+  annotate("text", x= 2, y = 58, label = "ns", size= 2.8) +
+  annotate("text", x= 3, y = 58, label = "ns", size= 2.8) +
+  annotate("text", x= 5, y = 58, label = "p=0.042", size= 2.8) +
+  annotate("text", x= 4, y = 58, label = "ns", size= 2.8) +
+  annotate("text", x= 6, y = 58, label = "p=0.0006", size= 2.8)
+
+ggarrange(IF1_B2M_tumor, IF1_B2M_stroma, nrow = 2)
+
+IF3_l <- IF3_p %>%
+  select(-patient) %>% 
+  gather(key = celltype, value = proportion, -sample) %>%
+  filter(grepl("tumor", celltype) == TRUE) %>% 
+  left_join(bp %>% select(sample, B2M_IMC20))
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <-IF3_cell_levels
+
+IF3_B2M_tumor <- IF3_l %>%
+  filter(!is.na(B2M_IMC20)) %>%
+  filter(celltype %in% IF3_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= B2M_IMC20)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") + 
+  theme_bw() + 
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(size=8), 
+        axis.title.y = element_text(size= 10),
+        axis.text.y = element_text(size= 8), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8),
+        legend.position = c(0.8,0.7)) + 
+  theme(plot.title = element_text(hjust = 0.5, size= 10)) +
+  scale_color_manual(values=c("#377eb8", "#e41a1c")) +
+  annotate("text", x= 1, y = 23, label = "p = 0.001", size= 2.8) +
+  annotate("text", x= 2, y = 23, label = "p = 0.001", size= 2.8) +
+  annotate("text", x= 3, y = 23, label = "p = 0.003", size= 2.8) +
+  annotate("text", x= 6, y = 23, label = "p = 0.00005", size= 2.8) +
+  annotate("text", x= 4, y = 23, label = "ns", size= 2.8) +
+  annotate("text", x= 5, y = 23, label = "ns", size= 2.8)
+
+IF3_l <- IF3_p %>% 
+  select(-patient) %>%
+  gather(key= celltype, value = proportion, -sample) %>% 
+  filter(grepl("stroma", celltype) == TRUE) %>%  
+  left_join(bp %>% select(sample, B2M_IMC20))
+
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <- IF3_cell_levels
+
+IF3_B2M_stroma <- IF3_l %>%
+  filter(!is.na(B2M_IMC20)) %>%
+  filter(celltype %in% IF3_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= B2M_IMC20)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  theme_bw() + 
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(size=8), 
+        axis.title.y = element_text(size= 10),
+        axis.text.y = element_text(size= 8), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_text(size = 10), 
+        legend.text = element_text(size = 8), 
+        legend.position =c(0.8,0.7)) + 
+  theme( plot.title = element_text(hjust = 0.5, size= 10)) + 
+  scale_color_manual(values=c("#377eb8", "#e41a1c")) +
+  annotate("text", x= 5, y = 35, label = "p = 0.020", size= 2.8) +
+  annotate("text", x= 3, y = 35, label = "p = 0.032", size= 2.8) +
+  annotate("text", x= 6, y = 35, label = "p = 0.004", size= 2.8) +
+  annotate("text", x= 1, y = 35, label = "p = 0.027", size= 2.8) +
+  annotate("text", x= 2, y = 35, label = "p = 0.015", size= 2.8) +
+  annotate("text", x= 4, y = 35, label = "ns", size= 2.8)
+
+ggarrange(IF3_B2M_tumor, IF3_B2M_stroma, nrow = 2)
+
+```
+
+## ICP expression
+
+```{r}
+#Figure 4H) ICP expression according to aPD1 treatment/status
+rna <- RNA %>%
+  select(sample, "LAG3", "HAVCR2", "TIGIT",
+         "ICOS", "VSIR", "CTLA4" , "CD40",
+         "CD70", "TNFRSF18", "TNFRSF4","TNFRSF9",
+         "TLR9", "LRRC32", "IDO1","CD274", "PDCD1") %>%
+  gather(key= gene, value= expression, -sample) %>%
+  left_join(samples %>% select(patient, sample)) %>%
+  left_join(colda %>% select(-sample))
+
+rna$AntiPD1_res22 <- rna$AntiPD1_res2
+levels(rna$AntiPD1_res22) <- c("N", "1R", "2R")
+
+ggplot(rna %>% filter(gene %in% c(
+  "LAG3", "HAVCR2", "TIGIT", "CTLA4" , "PDCD1"
+)),
+aes(y = expression, x = AntiPD1_res22 , col = AntiPD1_res22)) +
+  geom_boxplot() + facet_wrap( ~gene, ncol = 8) +
+  stat_compare_means(comparisons = list(c("N", "1R"),
+                                        c("1R", "2R"),
+                                        c("N", "2R")), size = 2.8) +
+  theme_bw() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(size = 8),
+    axis.title.y = element_text(size = 10),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8),
+    legend.position =  "none"
+  ) +
+  labs(y = "normalised mRNA expression")  +
+  scale_color_manual(values = c("#619CFF", "#fdae61", "#d7191c")) +
+  theme(strip.background = element_rect(colour = "black", fill = "yellow"))
+```
+
+## Survival analyses
+
+```{r}
+colda_pro <- colda %>% 
+  filter(AntiPD1_timing %in% c("PD1_first_next_treatment", "PD1_other_next_treatment")) %>% 
+  left_join(CNV %>% select(patient, B2M_LOH_CNV, B2M_CNV))
+```
+
+```{r}
+#Figure 5A) OS according to B2M LOH status
+fit <- survfit(Surv(Timing_start_PD1_OS_date_months, Death) ~ B2M_LOH_CNV ,
+               data = colda_pro)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("B2M LOH", "B2M WT"),
+  xlab = "Time (months)",
+  ylab = "Overall survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 3,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  #palette= c( "#F8766D","#00BA38", "#619CFF"),
+  risk.table.col = "strata"
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+```
+
+```{r}
+#Figure 5B) PFS according to B2M LOH status
+fit <- survfit(Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~ B2M_LOH_CNV ,
+               data = colda_pro)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("B2M LOH", "B2M WT"),
+  xlab = "Time (months)",
+  ylab = "Progression-free survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 3,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  #palette= c( "#F8766D","#00BA38", "#619CFF"),
+  risk.table.col = "strata"
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+ggsurv
+```
+
+```{r}
+#Figure 5C) OS according to B2M status
+fit <- survfit(Surv(Timing_start_PD1_OS_date_months, Death )~B2M_IMC20  , data= bp_pro )
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("B2M-low", "B2M-high"),
+  xlab = "Time (months)",
+  ylab = "Overall survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 1),
+  palette = c("Blue", "Red"),
+  risk.table.col = "strata"
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size= 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous( labels = c(0,25,50,75, 100))
+               
+ggsurv
+```
+
+```{r}
+#Figure 5C continuation
+bp_pro <- bp_pro %>% mutate(Age = case_when(
+  AntiPD1_timing_Rbiopsy_start_antiPD1 > 272 ~ Age_Rbiopsy + 1,
+  TRUE ~ Age_Rbiopsy
+))
+bp_pro <- bp_pro %>% mutate(
+  "B2M IMC" = B2M_IMC20,
+  "Age" = Age,
+  "Anti-PD1 regimen" = AntiPD1_regimen_bi,
+  'Anti-PD1 line' = factor(AntiPD1_line),
+  "HPV status" = HPV_status_temp,
+  "Disease extent" = case_when(
+    Metastatic_at_Rbiopsy == "Yes" ~ "Distant metastatic disease",
+    Metastatic_at_Rbiopsy == "No" ~ "Locoregional only disease"
+  ),
+  "ECOG" = factor(ECOG_si)
+)
+mod <- coxph(
+  Surv(Timing_start_PD1_OS_date_months, Death) ~  `B2M IMC` + Age + ECOG + `HPV status` + `Disease extent` + `Anti-PD1 regimen` +
+    `Anti-PD1 line` ,
+  data = bp_pro
+)
+forest_model(mod, format_options = forest_model_format_options(text_size = 3 , point_size = 2))
+```
+
+```{r}
+#Figure 5D) PFS according to B2M expression status
+fit <- survfit(Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~ B2M_IMC20  ,
+               data = bp_pro)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("B2M-low", "B2M-high"),
+  xlab = "Time (months)",
+  ylab = "Progression-free survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 1),
+  palette = c("Blue", "Red"),
+  risk.table.col = "strata"
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+
+```
+
+```{r}
+#Figure 5D continuation
+mod <- coxph(
+  Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~  `B2M IMC` + Age + ECOG + `HPV status` + `Disease extent` + `Anti-PD1 regimen` +
+    `Anti-PD1 line` ,
+  data = bp_pro
+)
+forest_model(mod, format_options = forest_model_format_options(text_size = 3 , point_size = 2))
+```
+
+```{r}
+#Figure 5E) aPD1 response according to B2M expression status
+pp <- data.frame(
+  B2M_IMC = c("B2M-high", "B2M-low"),
+  n = c(5, 4),
+  tot = c(8, 21),
+  freq = c(62.5, 19)
+)
+ggplot(pp, aes(x = B2M_IMC, y = freq)) +
+  geom_bar(stat = "identity",
+           position = "dodge",
+           width = 0.6) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_bw() +  labs(y = "Response rate (%)", fill = "", title = "") +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_blank(),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  ) +
+  geom_text(aes(label =  "p= 0.067", y = 60, x = 2), size = 3)
+```
+
+```{r}
+#Figure 5F) ROC curve of aPD1 response using B2M status (logstic regression)
+library(ISLR)
+library(ROCR)
+b2m_matrix <- read.csv(
+  "/home/daniel/IMMUCAN/H&N/IMC1_B2M_c_20240826.csv",
+  sep = ";",
+  row.names = 1,
+  dec = ","
+)
+b2m_matrix <- b2m_matrix[b2m_matrix$AntiPD1_timing %in% c("PD1_first_next_treatment", "PD1_other_next_treatment"), ]
+b2m_matrix <- b2m_matrix[!is.na(b2m_matrix$AntiPD1_responder), ]
+model_1 <- glm(
+  factor(b2m_matrix$AntiPD1_responder) ~ prop_cell,
+  family = "binomial",
+  data = b2m_matrix
+)
+predicted <- predict(model_1, b2m_matrix, type = "response")
+pred  <- prediction(predicted, factor(b2m_matrix$AntiPD1_responder))
+perf <- performance(pred, "auc")
+auc <- as.numeric(perf@y.values)
+roc_curve <- performance(pred, "tpr", "fpr")
+plot(roc_curve,
+     col = "blue",
+     main = "ROC Curve",
+     lwd = 2)
+abline(0,
+       1,
+       col = "gray",
+       lty = 2,
+       lwd = 1)
+auc
+pROC::ci.auc(factor(b2m_matrix$AntiPD1_responder), predicted)
+```
+
+```{r}
+IF2_CPS$CPS <- IF2_CPS$CPS_total
+bp_pro_i <- bp_pro %>% left_join(IF2_CPS) %>%
+  mutate(CPS_IF_bi = case_when(CPS >= 1 ~ ">1", CPS < 1 ~ "<1")) %>%
+  mutate(
+    B2M_CPS = case_when(
+      CPS >= 1 & B2M_IMC20 == "B2M-high" ~ "CPS>=1 B2M-high",
+      CPS >= 1 &
+        B2M_IMC20 == "B2M-low" ~ "CPS>=1 B2M-low",
+      CPS < 1 ~ "CPS<1 B2M-high/low"
+    )
+  )
+
+bp_pro_i$B2M_CPS <- factor(bp_pro_i$B2M_CPS,
+                           levels = c("CPS>=1 B2M-high", "CPS>=1 B2M-low", "CPS<1 B2M-high/low"))
+```
+
+```{r}
+#Figure 5G) OS according to combined CPS & B2M status
+fit <- survfit(Surv(Timing_start_PD1_OS_date_months, Death) ~ B2M_CPS , data = bp_pro_i)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.8, 0.85),
+  break.time.by = 5,
+  legend.labs = c("CPS>=1 B2M-high", "CPS>=1 B2M-low", "CPS<1 B2M-high/low"),
+  xlab = "Time (months)",
+  ylab = "Overall survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 3,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  palette = c("#F8766D", "#00BA38", "#619CFF"),
+  risk.table.col = "strata",
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+
+mod <- coxph(
+  Surv(Timing_start_PD1_OS_date_months, Death) ~  `B2M_CPS` + Age +  ECOG + `HPV status` + `Disease extent`  + `Anti-PD1 regimen` +
+    `Anti-PD1 line`,
+  data = bp_pro_i
+)
+forest_model(mod, format_options = forest_model_format_options(text_size = 3 , point_size = 2))
+```
+
+```{r}
+#Figure 5H) PFS according to combined CPS & B2M status
+fit <- survfit(Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~ B2M_CPS ,
+               data = bp_pro_i)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("CPS>=1 B2M-high", "CPS>=1 B2M-low", "CPS<1 B2M-high/low"),
+  xlab = "Time (months)",
+  ylab = "Progression-free survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 3,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  palette = c("#F8766D", "#00BA38", "#619CFF"),
+  risk.table.col = "strata"
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+
+mod <- coxph(
+  Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~  `B2M_CPS` + Age +  ECOG + `HPV status` + `Disease extent`  + `Anti-PD1 regimen` +
+    `Anti-PD1 line`,
+  data = bp_pro_i
+)
+forest_model(mod, format_options = forest_model_format_options(text_size = 3 , point_size = 2))
+```
+
+```{r}
+#Figure S4A) OS according to B2M expression status in aPD1-naive patients only
+bp_naive <- bp %>% 
+  filter(AntiPD1_before_Rbiopsy == "No") %>% 
+  mutate(PD1_responder = case_when(
+    AntiPD1_response  %in% c("Partial_response", "Complete_response") ~ "Responder",
+    AntiPD1_response %in% c("Stable_disease", "Progressive_disease") ~ "Non_responder")) %>%
+  mutate(Pre_antiPD1 = case_when(AntiPD1_timing  == "PD1_naive" ~ "No", 
+                                     TRUE ~ "Yes"))
+
+bp_n <- bp %>%
+  filter(AntiPD1_before_Rbiopsy == "No") %>% 
+  filter(AntiPD1_timing  == "PD1_naive")
+
+fit <- survfit(Surv(Timing_Rbiopsy_OS_date_months, Death) ~ B2M_IMC20 + Pre_antiPD1 ,
+               data = bp_naive)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c(
+    "B2M-low no antiPD1",
+    "B2M-low pre-antiPD1",
+    "B2M-high no antiPD1",
+    "B2M-high pre-antiPD1"
+  ),
+  xlab = "Time (months)",
+  ylab = "Overal survival",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 1),
+  #  palette= c("Blue", "Red")
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+
+ggsurv
+
+fit <- survfit(Surv(Timing_Rbiopsy_OS_date_months, Death) ~ B2M_IMC20 , data = bp_n)
+
+ggsurv <- ggsurvplot(
+  fit,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("B2M-low", "B2M-high"),
+  xlab = "Time (months)",
+  ylab = "Overall survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval = "p = 0.05",
+  pval.coord = c(15 , 1),
+  palette = c("Blue", "Red"),
+  risk.table.col = "strata"
+)
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100)) 
+
+ggsurv
+
+bp_n <- bp_n %>% mutate(Age = case_when(
+  AntiPD1_timing_Rbiopsy_start_antiPD1 > 272 ~ Age_Rbiopsy + 1,
+  TRUE ~ Age_Rbiopsy
+))
+
+bp_n <- bp_n %>% mutate(
+  "B2M IMC" = B2M_IMC20,
+  "Age" = Age,
+  "Anti-PD1 regimen" = AntiPD1_regimen_bi,
+  'Anti-PD1 line' = factor(AntiPD1_line),
+  "HPV status" = HPV_status_temp,
+  "Disease extent" = case_when(
+    Metastatic_at_Rbiopsy == "Yes" ~ "Distant metastatic disease",
+    Metastatic_at_Rbiopsy == "No" ~ "Locoregional only disease"
+  ),
+  "ECOG" = factor(ECOG_si),
+  "Number R/M line" = factor(max_line_before_Rbiopsy)
+)
+
+mod <- coxph(
+  Surv(Timing_Rbiopsy_OS_date_months, Death) ~
+    `B2M IMC` + Age + ECOG + `Disease extent` + `Number R/M line`,
+  data = bp_n
+)
+forest_model(mod, format_options = forest_model_format_options(text_size = 3 , point_size = 2))
+```
+
+```{r}
+#Figure S4B) TMB - B2M relation
+bpt <- bp %>%
+  left_join(molecular_scores %>% select(patient, tmb, TMB_level))
+
+
+ggscatter(
+  bpt,
+  "prop_cell",
+  "tmb",
+  cor.coef = TRUE,
+  cor.method = "spearman",
+  cor.coef.size = 2.8,
+  size = 1,
+  cor.coef.coord = c(75, 30)
+) + theme_bw() + 
+  labs(x = "Tumor cells B2M+/ total tumor cells (%) - IMC",
+       y = "TMB (mutation/Mb)",
+       fill = "",
+       title = "") + 
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_text(size = 10),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+    )
+
+
+ggplot(bpt, aes(x = B2M_IMC20, y = tmb)) +
+  geom_boxplot() +
+  stat_compare_means(
+  label = "p",
+  size = 2.8,
+  label.x = 1.4,
+  label.y = 28
+) + theme_bw() + 
+  labs(y = "TMB (mutation/Mb)", fill = "", title = "") +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8)
+  ) 
+
+```
+
+```{r}
+#Figure S4D) PDL1-TMB relation
+bpi <- bp %>% left_join(IF2_CPS) %>% 
+  mutate(PDL1_bi = case_when(PDL1_prop < 1 ~ "<1", TRUE ~ ">1")) %>%
+  mutate(CPS_IF_bi = case_when(CPS < 1 ~ "<1", TRUE ~ ">1"))
+
+ggscatter(
+  bpi,
+  "prop_cell",
+  "PDL1_prop",
+  cor.coef = TRUE,
+  cor.method = "spearman",
+  cor.coef.size = 2.8,
+  size = 1,
+  cor.coef.coord = c(70, 35)
+)   + theme_bw() +  
+  labs(x = "Tumor cells B2M+/ total tumor cells (%) - IMC",
+       y = "PDL1+ cells (%) - IF",
+       fill = "", title = "") + 
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_text(size = 10),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8)
+    )
+ggplot(bpi, aes(x = B2M_IMC20, y = CPS)) + geom_boxplot() + 
+  stat_compare_means(
+  label = "p",
+  size = 2.8,
+  label.x = 1.4,
+  label.y = 70
+) + theme_bw() +  
+  labs(y = "PDL1+ cells/ total tumor cells (%) - IF", 
+       fill = "", title = "") +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8)
+    ) 
+```
+
+```{r}
+#Figure S4E) TIS siganture - B2M relation
+bpr <- bp %>% left_join(sigs)
+ggscatter(bpr, "prop_cell", "TIS", 
+          cor.coef = TRUE, size= 1.5,
+          cor.method = "spearman", 
+          cor.coef.size = 2.8) +
+  theme_bw() +
+  theme(axis.title.x = element_text(size= 10),
+        axis.text.x = element_text(size=8), 
+        axis.title.y = element_text(size= 10),
+        axis.text.y = element_text(size= 8), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8), 
+        legend.position =  "right") +  
+  labs(y= "T cell inflamed GEP (normalized score)", 
+       x= "Tumor cells B2M+ / total tumor cells (%) - IMC") 
+
+ggplot(bpr, aes(x= B2M_IMC20, y= TIS)) + 
+  geom_boxplot() +
+  stat_compare_means(label= "p", size= 2.8, 
+                     label.x= 1.4, label.y = 1.5) +
+  theme_bw() +
+  labs( y= "T cell inflamed GEP (normalized score)",
+        fill = "", title ="") +
+  theme(axis.title.x = element_blank(),
+        axis.text.y = element_text(size=8 ), 
+        axis.title.y = element_text(size= 8),
+        axis.text.x = element_text(size= 8 ), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8)) 
+```
+
+```{r}
+#Figure S4F) APM sgnature - B2M relation
+ggscatter(bpr, "prop_cell", "APM_dou", 
+          cor.coef = TRUE, size= 1.5,
+          cor.method = "spearman", 
+          cor.coef.size = 2.8) +
+  theme_bw() +
+  theme(axis.title.x = element_text(size= 10),
+        axis.text.x = element_text(size=8), 
+        axis.title.y = element_text(size= 10),
+        axis.text.y = element_text(size= 8), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 8), 
+        legend.position =  "right") +  
+  labs(y= "APM signature (normalized score)", 
+       x= "Tumor cells B2M+ / total tumor cells (%) - IMC") 
+
+ggplot(bpr, aes(x= B2M_IMC20, y= APM_dou)) + 
+  geom_boxplot() +
+  stat_compare_means(label= "p", size= 2.8, 
+                     label.x= 1.4, label.y = 4.25) +
+  theme_bw() +
+  labs( y= "APM signature (normalized score)",
+        fill = "", title ="") +
+  theme(axis.title.x = element_blank(),
+        axis.text.y = element_text(size=8 ), 
+        axis.title.y = element_text(size= 8),
+        axis.text.x = element_text(size= 8 ), 
+        plot.title = element_text(size = 10), 
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8)) 
+```
+
+```{r}
+#Figure S4G) OS according to CPS status
+bp_pro_i$CPS_IF_bi <- factor(bp_pro_i$CPS_IF_bi, levels = c(">1", "<1"))
+
+fit <- survfit(Surv(Timing_start_PD1_OS_date_months, Death) ~ CPS_IF_bi ,
+               data = bp_pro_i)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("CPS>1", "CPS<1"),
+  xlab = "Time (months)",
+  ylab = "Overall survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  #palette= c( "Blue", "Red")
+)
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+```
+
+```{r}
+#Figure S4G) PFS according to CPS status
+fit <- survfit(Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~ CPS_IF_bi ,
+               data = bp_pro_i)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("CPS>1", "CPS<1"),
+  xlab = "Time (months)",
+  ylab = "Progression-free survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  #palette= c( "Blue", "Red")
+)
+
+
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+```
+
+```{r}
+#Prepare data frame for survival curves with RNA signature
+ff <- sigs %>% left_join(colda) %>% 
+  filter(AntiPD1_timing %in% c("PD1_first_next_treatment", "PD1_other_next_treatment"))
+
+TIS_med_pre <- median(ff$TIS)
+quantile(ff$TIS)[4]
+TIS_q3 <- quantile(ff$TIS)[4]
+TIS_q1 <- quantile(ff$TIS)[2]
+
+medi <- median(sigs$TIS)
+
+bp_pro_a <- bp_pro_i %>% left_join(molecular_scores %>% select(patient, tmb, TMB_level)) %>% left_join(sigs %>% select(patient, TIS)) %>% 
+  mutate(TIS_bi = case_when(TIS >= medi~ "TIS high",TIS < medi ~"TIS low" )) %>%  
+  mutate(TIS_bi_pre = case_when(TIS >= TIS_med_pre~ "TIS high",TIS < TIS_med_pre ~"TIS low" )) %>% 
+  mutate(TIS_tri = case_when(TIS >= TIS_q3~ "TIS high",
+                             TIS < TIS_q1~ "TIS low",
+                             TIS >= TIS_q1 &TIS < TIS_q3 ~ "TIS median" )) %>%   
+  mutate(TIS_q3 = case_when(TIS >= TIS_q3~ "TIS high",
+                             TIS < TIS_q3~ "TIS low" ))
+```
+
+```{r}
+#Figure S4H) OS according to T cell inflamed signature
+fit <- survfit(Surv(Timing_start_PD1_OS_date_months, Death) ~ TIS_bi  , data = bp_pro_a)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("Tcell infl GEP high", "Tcell infl GEP low"),
+  xlab = "Time (months)",
+  ylab = "Overall survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  risk.table.col = "strata",
+  #palette= c( "Blue", "Red")
+)
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+```
+
+```{r}
+#Figure S4H) PFS according to T cell inflamed signature
+fit <- survfit(Surv(AntiPD1_PFS_time_months, AntiPD1_PFS_status) ~ TIS_bi  ,
+               data = bp_pro_a)
+
+ggsurv <- ggsurvplot(
+  fit,
+  pval = TRUE,
+  legend = c(0.7, 0.85),
+  break.time.by = 5,
+  legend.labs = c("Tcell infl GEP high", "Tcell infl GEP low"),
+  xlab = "Time (months)",
+  ylab = "Progression-free survival (%)",
+  legend.title = "",
+  font.x = c(8),
+  font.y = 8,
+  font.legend = 8,
+  font.tickslab = 8,
+  ## axe graphe principal
+  risk.table = TRUE,
+  tables.theme =  clean_theme(),
+  fontsize = 2.5,
+  ## text size table
+  pval.size = 3,
+  pval.coord = c(15 , 0.95),
+  risk.table.col = "strata",
+  #palette= c( "Blue", "Red")
+)
+ggsurv$table <- ggsurv$table + theme(plot.title = element_text(size = 8))
+ggsurv$plot <- ggsurv$plot + scale_y_continuous(labels = c(0, 25, 50, 75, 100))
+
+ggsurv
+```

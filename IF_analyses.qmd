@@ -1,0 +1,704 @@
+---
+title: "IF_analyses_articleII"
+format: html
+editor: visual
+---
+
+# IF analyses
+
+## Loading and processing data
+
+```{r output=FALSE}
+#Libraries
+library(readr)
+library(dplyr)
+library(ggpubr)
+library(readxl)
+library(tidyr)
+library(glue)
+
+#Imports
+source("/home/daniel/PaperII_SCCHN/Code/utils.R")
+```
+
+```{r output=FALSE}
+#General definitions
+#Cell types of interest
+IF1_cell_types_int <- c( "B cells", "BnT cells",
+                         "DC", "MacCD163+",
+                         "Neutrophils", "T cells")
+IF3_cell_types_int <- c("CD4+CD8+Tcells", "CD4+Tcells",
+                        "CD8+Tcells", "NK", "NKT",
+                        "Tregs")
+#Levels for factors whenever needed
+IF1_cell_levels <- c( "B cells", "BnT cells",
+                      "DC", "MacCD163+",
+                      "Neutrophils", "other_totalR",
+                      "T cells", "Tumor_tumorR")
+IF3_cell_levels <- c("CD4+CD8+Tcells", "CD4+Tcells",   
+                     "CD8+Tcells", "NK", "NKT",
+                     "other_totalR", "Tother", 
+                     "Tregs", "Tumor_tumorR" )
+#Baseline plot for figures
+IF_style <- function(figure, legend_position, 
+                         colors_opt) {
+  return(figure + 
+           theme_bw() +
+           theme(axis.title.x = element_blank(),
+                 axis.text.x = element_text(size=8), 
+                 axis.title.y = element_text(size= 10),
+                 axis.text.y = element_text(size= 8), 
+                 plot.title = element_text(size = 10),
+                 legend.title = element_text(size = 10), 
+                 legend.text = element_text(size = 8), 
+                 legend.position =  legend_position) + 
+           theme( plot.title = element_text(hjust = 0.5, size= 10)) +
+           scale_color_manual(values=colors_opt))
+}
+```
+
+```{r output = FALSE}
+#Data directories
+path_metadata <- "/home/daniel/IMMUCAN/Upstream/Metadata_Clinicaldata"
+path_wes <- "/home/daniel/IMMUCAN/H&N/WES_tables/FinalFilesv2"
+path_IF <- "/home/daniel/IMMUCAN/H&N/IF_tables/FinalTables"
+
+#Load files
+coldata <- read.csv2(glue("{path_metadata}/IMMUCAN_HN_298_20240821.csv"))
+coldata_samples <- read_csv2(glue("{path_metadata}/coldata_samples_all_SCCHN_20240624.csv"))
+
+CNV <- read.csv2(glue("{path_wes}/HN_CNVgene_immune_20240819.csv"))
+pathways <- read.csv2(glue("{path_wes}/HN_pathways_20240820.csv"))
+
+ICP <- read_csv2("/home/daniel/IMMUCAN/H&N/IMC_tables/IMC1_icp_20240905.csv")
+tumor <- read_csv2("/home/daniel/IMMUCAN/H&N/IMC_tables/IMC1_tumor_phenotypes_20240807.csv")
+
+IF1_p <- read_csv2(glue("{path_IF}/IF1_cell_proportions_all_samples_20210710.csv"))
+IF3_p <- read_csv2(glue("{path_IF}/IF3_cellsproportions_all_samples_20240710.csv"))
+IF2_tumor <- read_csv2(glue("{path_IF}/IF2_tumor_scores_all_samples_20240710.csv"))
+IF2_CD8 <- read_csv2(glue("{path_IF}/IF2_CD8_full_scores_all_samples_20240710.csv"))
+TLS <- read_xlsx("/home/daniel/IMMUCAN/H&N/IF1_TLS.xlsx")
+Immunetype <-  read_csv("/home/daniel/IMMUCAN/H&N/ImmuneType_CD8_IF3_g.csv")
+IF2_CPS <- read_csv2(glue("{path_IF}/IF2_CPS_scores_all_samples.csv"))
+```
+
+```{r}
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0480"] <- "Stable_disease"
+coldata$AntiPD1_response[coldata$patient== "UPST-SCCHN3-0511"] <- "Stable_disease"
+## "UPST-SCCHN3-0484" progressive disease while secondary resistant, but real, already progression reported at 3 months
+coldata$AntiPD1_benefit[coldata$patient== "UPST-SCCHN3-0484"] <- "No_benefit"
+coldata$AntiPD1_resistance[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+coldata$AntiPD1_resistance_si[coldata$patient== "UPST-SCCHN3-0484"] <- "Primary_resistance"
+```
+
+```{r}
+#Preprocess clinical data
+colda <- transform_coldata(coldata)
+
+#Create some clinical variables
+colda <- colda %>%
+  mutate(Pre_antiPD1 = case_when(AntiPD1_timing  == "PD1_naive" ~"No",
+                                 AntiPD1_timing %in% c("PD1_last_treatment",
+                                                       "PD1_previous_treatment") ~"No",  
+                                 TRUE ~"Yes"))
+
+colda$AntiPD1_timing <- factor(colda$AntiPD1_timing, 
+                               levels= c("PD1_other_next_treatment",
+                                         "PD1_first_next_treatment",
+                                         "PD1_naive",
+                                         "PD1_previous_treatment","PD1_last_treatment" ))
+
+colda$AntiPD1_regimen_si[colda$AntiPD1_regimen_si== "Combinaison_chemo_and_ICI_other"] <- "Combinaison_chemo_ICI_other"
+
+colda$AntiPD1_res3 <- factor(colda$AntiPD1_res)
+levels(colda$AntiPD1_res3) <- c("Anti-PD1 naive", "Primary resistant", "Secondary resistant")
+
+colda$PD1_res3 <- factor(colda$PD1_res)
+levels(colda$PD1_res3) <- c("Anti-PD1 naive", "Anti-PD1 resistant")
+
+#Preprocess samples data
+samples <- transform_sampdata(coldata_samples)
+
+#Filter genomic data
+CNV <- CNV %>% 
+  filter(sample %in% samples$sample) 
+
+pathways <- pathways %>% 
+  filter(sample %in% samples$sample) %>% 
+  left_join(samples %>% select(sample, patient)) 
+
+#Filter IF data
+IF_filter <- function(df, colda_df) {
+  df %>%
+    filter(sample %in% colda_df$Rbiopsy_FFPE_ID) %>%
+    left_join(colda_df  %>% select(Rbiopsy_FFPE_ID, patient),
+            by= c("sample" = "Rbiopsy_FFPE_ID")) 
+}
+
+IF1_p <- IF_filter(IF1_p, colda) 
+IF3_p <- IF_filter(IF3_p, colda) 
+IF2_CD8 <- IF_filter(IF2_CD8, colda) 
+IF2_tumor <- IF_filter(IF2_tumor, colda) 
+TLS <- IF_filter(TLS, colda) 
+Immunetype <- IF_filter(Immunetype, colda) 
+
+Immunetype_na <- Immunetype %>% 
+  filter(is.na(immuneCD8_type_3))
+
+IF <- colda %>%
+  select(patient, Rbiopsy_FFPE_ID) %>% 
+  left_join(IF1_p %>% select(-patient),by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(IF3_p%>% select(-patient), by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(IF2_CD8%>% select(-patient), by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(IF2_tumor%>% select(-patient), by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(TLS%>% select(-patient), by= c("Rbiopsy_FFPE_ID" ="sample" )) %>% 
+  left_join(Immunetype%>% select(-patient), by= c("Rbiopsy_FFPE_ID" ="sample" )) 
+
+Immunetype_c <- Immunetype %>% 
+  left_join(colda, by= c("sample" ="Rbiopsy_FFPE_ID" ))
+TLS_c <- TLS %>%
+  left_join(colda, by= c("sample" ="Rbiopsy_FFPE_ID" ))
+
+IF_c <- IF %>% 
+  left_join(coldata_samples %>% 
+              select(sample, samptype), 
+            by= c("Rbiopsy_FFPE_ID" ="sample" )) %>%
+  left_join(colda %>% select(-Rbiopsy_FFPE_ID))
+
+IF2_CD8 <- IF2_CD8 %>% filter(!sample %in% Immunetype_na$sample)
+IF2_CD8 <- IF2_CD8 %>% select(-sample) %>% select(patient, everything())
+IF1_p <- IF1_p %>% select(-sample) %>% select(patient, everything())
+IF3_p <- IF3_p %>% select(-sample) %>% select(patient, everything())
+IF2_tumor <- IF2_tumor%>% select(-sample) %>% select(patient, everything())
+```
+
+## WES-IF analyses
+
+```{r}
+#Figure S2D-E) Immune populations in B2M WT or LOH patients
+IF1_l <- IF1_p %>%  
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("total", celltype)== TRUE) %>%
+  left_join(CNV %>%
+              filter(B2M_LOH != "Deletion" ) %>%
+              select(patient, B2M_LOH)) %>%
+  filter(!is.na(B2M_LOH)) 
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <-IF1_cell_levels
+
+IF1_l$B2M_LOH[IF1_l$B2M_LOH == "noCNA"] <- "B2M WT"
+IF1_l$B2M_LOH[IF1_l$B2M_LOH == "LOH"] <- "B2M LOH"
+
+
+IF1_B2MLOH <- IF1_l %>% 
+  filter(celltype %in% IF1_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= B2M_LOH)) +
+  labs(x= "", y= "Cells in total region (%)" , col= "") +
+  theme_bw() + 
+  base_plot_style + 
+  theme( plot.title = element_text(hjust = 0.5, size= 10)) +
+        annotate("text", x= 1:6, y = 40, label = "ns", size= 2.8)
+
+IF3_l <- IF3_p %>%
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("total", celltype)== TRUE) %>%
+  left_join(CNV %>%
+              filter(B2M_LOH != "Deletion" ) %>%
+              select(patient, B2M_LOH)) %>%
+  filter(!is.na(B2M_LOH)) 
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <-IF3_cell_levels
+
+IF3_l$B2M_LOH[IF3_l$B2M_LOH == "noCNA"] <- "B2M WT"
+IF3_l$B2M_LOH[IF3_l$B2M_LOH == "LOH"] <- "B2M LOH"
+
+
+IF3_B2MLOH <-IF3_l %>% 
+  filter(celltype %in% IF3_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= B2M_LOH)) +
+  labs(x= "", y= "Cells in total region (%)" , col= "") +
+  theme_bw() + 
+  base_plot_style + 
+  theme( plot.title = element_text(hjust = 0.5, size= 10)) +
+        annotate("text", x= 1:6, y = 27, label = "ns", size= 2.8)
+
+ggarrange(IF1_B2MLOH, IF3_B2MLOH, nrow = 2)
+
+
+IF1_l <- IF1_p %>%  
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("total", celltype)== TRUE) %>%
+  left_join(CNV %>%
+              filter(B2M_LOH != "Deletion" ) %>%
+              select(patient, B2M_loss)) %>%
+  filter(!is.na(B2M_loss)) 
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <-IF1_cell_levels
+
+IF1_l$B2M_loss[IF1_l$B2M_loss == "noCNA"] <- "B2M WT"
+IF1_l$B2M_loss[IF1_l$B2M_loss == "LOSS"] <- "B2M loss"
+
+
+IF1_B2Mloss <- IF1_l %>% 
+  filter(celltype %in% IF1_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= B2M_loss)) +
+  labs(x= "", y= "Cells in total region (%)" , col= "") +
+  theme_bw() + 
+  base_plot_style + 
+  theme( plot.title = element_text(hjust = 0.5, size= 10)) +
+        annotate("text", x= 1:6, y = 40, label = "ns", size= 2.8)
+
+
+IF3_l <- IF3_p %>%  
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("total", celltype)== TRUE) %>%
+  left_join(CNV %>%
+              filter(B2M_LOH != "Deletion" ) %>%
+              select(patient, B2M_loss)) %>%
+  filter(!is.na(B2M_loss)) 
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <-IF3_cell_levels
+
+IF3_l$B2M_loss[IF3_l$B2M_loss == "noCNA"] <- "B2M WT"
+IF3_l$B2M_loss[IF3_l$B2M_loss == "LOSS"] <- "B2M loss"
+
+
+IF3_B2Mloss <- IF3_l %>% 
+  filter(celltype %in% IF3_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= B2M_loss)) +
+  labs(x= "", y= "Cells in total region (%)" , col= "") +
+  theme_bw() + 
+  base_plot_style + 
+  theme( plot.title = element_text(hjust = 0.5, size= 10)) +
+        annotate("text", x= 1:6, y = 27, label = "ns", size= 2.8)
+ggarrange(IF1_B2Mloss, IF3_B2Mloss, nrow = 2)
+```
+
+```{r}
+#Figure 2B-C) Immune populations in MYC pathway WT or altered
+IF1_l <- IF1_p %>% 
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("tumor", celltype)== TRUE)  %>% 
+  left_join(pathways %>% select(patient, MYC))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <- IF1_cell_levels
+IF1_l$MYC[IF1_l$MYC == "noAlteration"] <- "MYC pathway WT"
+IF1_l$MYC[IF1_l$MYC == "Yes"] <- "MYC pathway altered"
+
+IF1_myc_tumor <- IF1_l %>%
+  filter(celltype %in% IF1_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= MYC)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") +
+  annotate("text", x= 1:6, y = 40, label = "ns", size= 2.8) 
+IF1_myc_tumor <- IF_style(IF1_myc_tumor,
+                              c(0.25,0.6),
+                              c("#2c7bb6", "#fdae61"))
+
+
+IF1_l <- IF1_p %>% 
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("stroma", celltype)== TRUE) %>% 
+  left_join(pathways %>% select(patient, MYC))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <- IF1_cell_levels
+IF1_l$MYC[IF1_l$MYC == "noAlteration"] <- "MYC pathway WT"
+IF1_l$MYC[IF1_l$MYC == "Yes"] <- "MYC pathway altered"
+
+IF1_myc_stroma <- IF1_l %>% 
+  filter(celltype %in% c(IF1_cell_types_int)) %>%
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= MYC)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  annotate("text", x= 1:6, y = 50, label = "ns", size= 2.8)
+IF1_myc_stroma <- IF_style(IF1_myc_stroma,
+                               c(0.25,0.6), 
+                               c("#2c7bb6", "#fdae61"))
+ggarrange(IF1_myc_tumor, IF1_myc_stroma, nrow = 2)
+
+IF3_l <- IF3_p %>%
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("stroma", celltype)== TRUE) %>% 
+  left_join(pathways %>% select(patient, MYC))
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <- IF3_cell_levels
+IF3_l$MYC[IF3_l$MYC == "noAlteration"] <- "MYC pathway WT"
+IF3_l$MYC[IF3_l$MYC == "Yes"] <- "MYC pathway altered"
+
+IF3_myc_stroma <- IF3_l %>% 
+  filter(celltype %in% IF3_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= MYC)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  annotate("text", x= 1:3, y = 35, label = "ns", size= 2.8) +
+  annotate("text", x= 4, y = 35, label = "p=0.047", size= 2.8) +
+  annotate("text", x= 5:6, y = 35, label = "ns", size= 2.8) 
+IF3_myc_stroma <- IF_style(IF3_myc_stroma,
+                           c(0.8,0.65),
+                           c("#2c7bb6", "#fdae61"))
+
+IF3_l <- IF3_p %>%
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("tumor", celltype)== TRUE) %>%
+  left_join(pathways %>% select(patient, MYC))
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <- IF3_cell_levels
+
+IF3_l$MYC[IF3_l$MYC == "noAlteration"] <- "MYC pathway WT"
+IF3_l$MYC[IF3_l$MYC == "Yes"] <- "MYC pathway altered"
+
+
+IF3_myc_tumor <- IF3_l  %>%
+  filter(celltype %in% IF3_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= MYC)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "")  +
+  annotate("text", x= 1, y = 27, label = "ns", size= 2.8) +
+  annotate("text", x= 2, y = 27, label = "p= 0.011", size= 2.8) +
+  annotate("text", x= 3:5, y = 27, label = "ns", size= 2.8) +
+  annotate("text", x= 6, y = 27, label = "p=0.008", size= 2.8)
+IF3_myc_tumor <- IF_style(IF3_myc_tumor,
+                           c(0.8,0.65),
+                           c("#2c7bb6", "#fdae61"))
+
+ggarrange(IF3_myc_tumor, IF3_myc_stroma, nrow = 2)
+```
+
+```{r}
+EGFR_figure <- function(IF1_df, IF_levels, IF_int,
+                        region, table_to_join) {
+  IF1_l <- IF1_df %>% 
+    gather(key= celltype, value= proportion, -patient) %>%
+    filter(grepl(region, celltype)== TRUE) %>% 
+    left_join(table_to_join)
+  IF1_l$celltype <- factor(IF1_l$celltype)
+  levels(IF1_l$celltype) <- IF_levels
+  
+  IF1_l$EGFR[IF1_l$EGFR == "noCNA"] <- "EGFR WT"
+  IF1_l$EGFR[IF1_l$EGFR == "Amplification"] <- "EGFR amplification"
+  
+  IF1_egfr <- IF1_l %>%
+    filter(celltype %in% IF_int) %>%
+    ggplot(aes(x= celltype, y= proportion)) +
+    geom_boxplot(aes(col= EGFR)) +
+    labs(x= "" , col= "") + 
+    theme_bw() +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(size=8), 
+          axis.title.y = element_text(size= 10),
+          axis.text.y = element_text(size= 8), 
+          plot.title = element_text(size = 10),
+          legend.title = element_text(size = 10), 
+          legend.text = element_text(size = 8)) 
+  return(IF1_egfr)
+}
+```
+
+```{r}
+#Figure 2D-E) Immune populations in EGFR WT or amplified patients
+IF1_egfr_tumor <- EGFR_figure(IF1_p, IF1_cell_levels,
+                              IF1_cell_types_int, 
+                              "tumor", CNV) +
+  ylab("Cells in tumor region (%)") +        
+  theme(legend.position = c(0.2,0.6)) + 
+  annotate("text", x= 1:2, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 3, y = 40, label = "p=0.029", size= 2.8) +
+  annotate("text", x= 4:6, y = 40, label = "ns", size= 2.8)
+
+IF1_egfr_stroma <- EGFR_figure(IF1_p,IF1_cell_levels,
+                              IF1_cell_types_int, 
+                              "stroma", CNV) + 
+  ylab("Cells in stroma region (%)") + 
+  theme(legend.position = c(0.2,0.6)) + 
+  annotate("text", x= 1, y = 50, label = "p=0.041", size= 2.8)+
+  annotate("text", x= 2, y = 50, label = "ns", size= 2.8)+
+  annotate("text", x= 3, y = 50, label = "p=0.043", size= 2.8)+
+  annotate("text", x= 4:6, y = 50, label = "ns", size= 2.8)
+
+ggarrange(IF1_egfr_tumor, IF1_egfr_stroma, nrow = 2)
+
+  
+IF3_egfr_tumor <- EGFR_figure(IF3_p, IF3_cell_levels,
+                              IF3_cell_types_int, 
+                              "tumor", CNV) +
+  ylab("Cells in tumor region (%)") +
+  theme(legend.position = c(0.8,0.6)) + 
+  annotate("text", x= 1:6, y = 23, label = "ns", size= 2.8)
+
+IF3_egfr_stroma <- EGFR_figure(IF3_p, IF3_cell_levels,
+                              IF3_cell_types_int, 
+                              "stroma", CNV) +
+  ylab("Cells in stroma region (%)") +
+  theme(legend.position = c(0.8,0.6)) + 
+  annotate("text", x= 1:6, y = 35, label = "ns", size= 2.8) 
+
+ggarrange(IF3_egfr_tumor, IF3_egfr_stroma, nrow = 2)
+```
+
+## aPD1 treatment/resistance analyses
+
+```{r}
+#Figures S3A-B) Immune cell proportions in aPD1 naive or resistant
+IF1_l <- IF1_p %>%
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("tumor", celltype)== TRUE) %>%  
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <- IF1_cell_levels
+
+IF1_tumor_2 <- IF1_l %>%
+  filter(celltype %in% IF1_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= PD1_res3)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") +
+  annotate("text", x= 2:6, y = 40, label = "ns", size= 2.8) +
+  annotate("text", x= 1, y = 40, label = "p=0.014", size= 2.8)
+IF1_tumor_2 <- IF_style(IF1_tumor_2,
+                         "right",
+                         c("#2c7bb6", "#e66101"))
+IF1_l <- IF1_p %>% 
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("stroma", celltype)== TRUE) %>% 
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <-IF1_cell_levels
+
+IF1_stroma_2 <- IF1_l %>%
+  filter(celltype %in% IF1_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= PD1_res3)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") + 
+          annotate("text", x= 2, y = 50, label = "p=0.004", size= 2.8)+
+          annotate("text", x= 3:6, y = 50, label = "ns", size= 2.8)+
+          annotate("text", x= 1, y = 50, label = "p=0.007", size= 2.8)
+IF1_stroma_2 <- IF_style(IF1_stroma_2,
+                         "right",
+                         c("#2c7bb6", "#e66101"))
+
+ggarrange(IF1_tumor_2, IF1_stroma_2, nrow = 2)
+
+IF3_l <- IF3_p %>%
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("tumor", celltype)== TRUE) %>%
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <- IF3_cell_levels
+
+IF3_tumor_naive_res <- IF3_l  %>% 
+  filter(celltype %in% IF3_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= PD1_res3)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") +
+  annotate("text", x= 1:6, y = 27, label = "ns", size= 2.8)
+IF3_tumor_naive_res <- IF_style(IF3_tumor_naive_res,
+                                     "right",
+                                     c("#2c7bb6", "#e66101"))
+
+IF3_l <- IF3_p %>% 
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("stroma", celltype)== TRUE) %>% 
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <-IF3_cell_levels
+
+IF3_stroma_naive_res <- IF3_l %>%
+  filter(celltype %in% IF3_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= PD1_res3)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  annotate("text", x= 1:2, y = 35, label = "ns", size= 2.8) +
+  annotate("text", x= 3, y = 35, label = "p=0.023", size= 2.8) +
+  annotate("text", x= 4:6, y = 35, label = "ns", size= 2.8)
+IF3_stroma_naive_res <- IF_style(IF3_stroma_naive_res,
+                                     "right",
+                                     c("#2c7bb6", "#e66101"))
+
+ggarrange(IF3_tumor_naive_res, IF3_stroma_naive_res, nrow = 2)
+```
+
+```{r}
+#Figure S3C) TLS presence in pre and post aPD1 patients
+IF_c$any_tls[IF_c$any_tls== "TRUE"] <- "True"
+IF_c$any_tls[IF_c$any_tls== "FALSE"] <- "False"
+IF_c  %>% 
+  filter(!is.na(any_tls)) %>% 
+  ggplot(aes(x= PD1_res2, fill= any_tls)) +
+  geom_bar(position= "fill") +  
+  theme_bw() +  
+  base_plot_style +  
+  labs( y= "Proportion of patients", fill= "Presence of TLS") +
+  scale_fill_manual(values= c( "grey", "#636363"))
+
+```
+
+```{r}
+#Figure 4C-D) Immune cell proportions in aPD1 treatment/resistance
+IF1_l <- IF1_p %>%
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("tumor", celltype)== TRUE)  %>%  
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <- IF1_cell_levels
+tumor_1_3 <- IF1_l %>%
+  filter(celltype %in% IF1_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= AntiPD1_res3)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") +
+  annotate("text", x= 6.3, y = 41.5, label = "p=0.020", size= 2.8) +
+  annotate("text", x= 1:6, y = 45, label = "ns", size= 2.8) +
+  geom_segment(aes(x = 5.7, xend = 6.3, y = 44, yend = 44), linewidth = 0.5) +
+  geom_segment(aes(x =  6, xend = 6.3, y = 40, yend = 40), linewidth = 0.5)
+tumor_1_3 <- IF_style(tumor_1_3, "right", 
+                      c("#2c7bb6", "#fdae61", "#d7191c"))
+
+IF1_l <- IF1_p %>%
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("stroma", celltype)== TRUE) %>% 
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+IF1_l$celltype <- factor(IF1_l$celltype)
+levels(IF1_l$celltype) <- IF1_cell_levels
+
+stroma_1_3 <- IF1_l %>% 
+  filter(celltype %in% IF1_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) +
+  geom_boxplot(aes(col= AntiPD1_res3)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  annotate("text", x= 6.3, y = 47, label = "p=0.045", size= 2.8) +
+          annotate("text", x= 1:6, y = 52, label = "ns", size= 2.8) +
+  geom_segment(aes(x = 5.7, xend = 6.3, y = 50, yend = 50), linewidth = 0.5) +
+  geom_segment(aes(x =  6, xend = 6.3, y = 45, yend = 45), linewidth = 0.5) 
+stroma_1_3 <- IF_style(stroma_1_3, "right", 
+                      c("#2c7bb6", "#fdae61", "#d7191c"))
+
+ggarrange(tumor_1_3, stroma_1_3, nrow = 2)
+
+
+IF3_l <- IF3_p %>% 
+  gather(key= celltype, value= proportion, -patient) %>%
+  filter(grepl("tumor", celltype)== TRUE) %>%
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <- IF3_cell_levels
+
+
+IF3_tumor_naive_prim_sec <- IF3_l %>% 
+  filter(celltype %in% IF3_cell_types_int) %>% 
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= AntiPD1_res3)) +
+  labs(x= "", y= "Cells in tumor region (%)" , col= "") +
+  theme_bw() + 
+  base_plot_style + 
+  theme(plot.title = element_text(hjust = 0.5, size= 10)) +
+  scale_color_manual(values=c(  "#2c7bb6", "#fdae61", "#d7191c")) +
+  annotate("text", x= 1, y = 27, label = "ns", size= 2.8) +
+  annotate("text", x= 1.3, y = 24, label = "p=0.021", size= 2.8) +
+  annotate("text", x= 2, y = 27, label = "ns", size= 2.8) +
+  annotate("text", x= 3, y = 27, label = "p=0.0008", size= 2.8) +
+  annotate("text", x= 3.3, y = 24, label = "p=0.003", size= 2.8) +
+  annotate("text", x= 4, y = 27, label = "ns", size= 2.8) +
+  annotate("text", x= 5, y = 27, label = "p=0.013", size= 2.8) +
+  annotate("text", x= 5.3, y = 24, label = "p=0.049", size= 2.8) +
+  annotate("text", x= 6.3, y = 24, label = "p=0.031", size= 2.8) +
+  annotate("text", x= 6, y = 27, label = "p=0.041", size= 2.8) +
+  geom_segment(aes(x = 2.7, xend = 3.3, y = 26, yend = 26), linewidth = 0.5) +
+  geom_segment(aes(x = 3, xend = 3.3, y = 23, yend = 23), linewidth = 0.5) +
+  geom_segment(aes(x = 0.7, xend = 1.3, y = 26, yend = 26), linewidth = 0.5) +
+  geom_segment(aes(x = 1 , xend = 1.3, y = 23, yend = 23), linewidth = 0.5) +
+  geom_segment(aes(x = 5.7, xend = 6.3, y = 26, yend = 26), linewidth = 0.5) +
+  geom_segment(aes(x =  6, xend = 6.3, y = 23, yend = 23), linewidth = 0.5) +
+  geom_segment(aes(x = 4.7, xend = 5.3, y = 26, yend = 26), linewidth = 0.5) +
+  geom_segment(aes(x =  5, xend = 5.3, y = 23, yend = 23), linewidth = 0.5) 
+
+IF3_l <- IF3_p %>% 
+  gather(key= celltype, value= proportion, -patient) %>% 
+  filter(grepl("stroma", celltype)== TRUE) %>%
+  left_join(colda %>% select(patient, AntiPD1_res3, PD1_res3))
+
+
+IF3_l$celltype <- factor(IF3_l$celltype)
+levels(IF3_l$celltype) <-IF3_cell_levels
+
+
+IF3_stroma_naive_prim_sec <- IF3_l %>%
+  filter(celltype %in% IF3_cell_types_int) %>%
+  ggplot(aes(x= celltype, y= proportion)) + 
+  geom_boxplot(aes(col= AntiPD1_res3)) +
+  labs(x= "", y= "Cells in stroma region (%)" , col= "") +
+  theme_bw() + 
+  base_plot_style + 
+  theme(plot.title = element_text(hjust = 0.5, size= 10)) +
+  scale_color_manual(values=c("#2c7bb6", "#fdae61", "#d7191c")) +
+  annotate("text", x= 1:2, y = 35, label = "ns", size= 2.8) +
+  annotate("text", x= 3, y = 35, label = "p=0.0004", size= 2.8) +
+  annotate("text", x= 3.3, y = 31, label = "p=0.003", size= 2.8) +
+  annotate("text", x= 4:5, y = 35, label = "ns", size= 2.8) +
+  annotate("text", x= 6.3, y = 31, label = "p=0.018", size= 2.8) +
+  annotate("text", x= 6, y = 35, label = "p=0.008", size= 2.8) +
+  geom_segment(aes(x = 2.7, xend = 3.3, y = 33.5, yend = 33.5), linewidth = 0.5) +
+  geom_segment(aes(x = 3, xend = 3.3, y = 29.5, yend = 29.5), linewidth = 0.5) +
+  geom_segment(aes(x = 5.7, xend = 6.3, y = 33.5, yend = 33.5), linewidth = 0.5) +
+  geom_segment(aes(x =  6, xend = 6.3, y = 29.5, yend = 29.5), linewidth = 0.5)
+
+ggarrange(IF3_tumor_naive_prim_sec, IF3_stroma_naive_prim_sec, nrow = 2)
+```
+
+```{r}
+#Figure 4E) CD8+ T cell phenotypes in aPD1 treatment/resistance
+IF_c$immuneCD8 <- factor(IF_c$immuneCD8_type_3)
+levels(IF_c$immuneCD8) <- c("Tcell CD8+ desert", 
+                            "Tcell CD8+ excluded", 
+                            "Tcell CD8+ infiltrated")
+IF_c  %>% 
+  filter(!is.na(immuneCD8_type_3)) %>% 
+  ggplot(aes(x= AntiPD1_res2, fill= immuneCD8)) +
+  geom_bar(position= "fill") + 
+  theme_bw() +  
+  base_plot_style + 
+  labs( y= "Proportion of patients" , 
+        fill= "Immune phenotype") + 
+  scale_fill_manual(values = c("yellow", "orange", "red"))
+```
+
+```{r}
+#Figure S4C) Correlation between clinical CPS and pseudo-CPS (PDL1+ tumor cells from IF)
+col <- colda %>%
+  select(patient, Rbiopsy_FFPE_ID, CPS_PDL1_date, 
+         CPS_PDL1, CPS_PDL1_si) %>%
+  left_join(coldata_samples %>%
+              select(sample, SAMPDAT),
+            by= c("Rbiopsy_FFPE_ID"= "sample")) %>%
+  left_join(IF2_tumor)
+
+co <- col %>% 
+  mutate(sd= case_when(CPS_PDL1_date== SAMPDAT ~"same", 
+                       TRUE ~"Other"))
+ggscatter(co %>% filter(sd== "same"), 
+          "CPS_total", "CPS_PDL1", 
+          cor.coef = TRUE, cor.method = "spearman",
+          size= 1, cor.coef.size = 2.8, 
+          cor.coef.coord = c(8,85)) +
+  theme_bw() +
+  base_plot_style + theme(axis.title.x = element_text(10)) + 
+  labs( y= "Clinical CPS" ,
+        x= "PDL1+ cells / total tumor cells (%) - IF")
+```

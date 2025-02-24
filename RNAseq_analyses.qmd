@@ -1,0 +1,259 @@
+---
+title: "Article_II_RNAseq"
+format: html
+editor: visual
+---
+
+# RNA analyses
+
+```{r output=FALSE}
+#Libraries
+library(tidyr)
+library(dplyr)
+library(DESeq2)
+library(ggplot2)
+```
+
+## Loading and processing data
+
+```{r}
+#Files
+raw_counts_IMMU_file <- "/home/daniel/IMMUCAN/SCCHN1/RNAseq/full_counts_HUGO_matrix.tsv"
+raw_counts_UPST_file <- "/home/daniel/IMMUCAN/Upstream/RNAseqCounts/full_counts_HUGO_matrix.tsv"
+samples_file <- "/home/daniel/IMMUCAN/Upstream/Metadata_Clinicaldata/coldata_samples_all_SCCHN_20240624.csv"
+clinical_file <- "/home/daniel/IMMUCAN/Upstream/Metadata_Clinicaldata/IMMUCAN_HN_298_20240821.csv"
+
+#Import files
+raw_counts_IMMU <- read.table(raw_counts_IMMU_file, header = TRUE,
+                           sep = "\t", row.names = 1, check.names = FALSE)
+raw_counts_UPST <- read.table(raw_counts_UPST_file, header = TRUE,
+                              sep = "\t", row.names = 1, check.names = FALSE)
+raw_counts <- cbind(raw_counts_IMMU, raw_counts_UPST)
+
+samples_data_raw <- read.csv(samples_file, sep = ";")
+samples_data_raw <- samples_data_raw[!duplicated(samples_data_raw$sample),]
+rownames(samples_data_raw) <- samples_data_raw$sample
+
+clinical_data_raw <- read.csv(clinical_file, sep = ";", row.names = 6)
+
+#Select samples with available RNA
+samples_data <- samples_data_raw[rownames(samples_data_raw) %in% colnames(raw_counts) &
+                                   samples_data_raw$SAMP_timepoint %in% c("Registration", 
+                                                                          "UPSTREAM_Post_treatment",
+                                                                          "At progression"), ]
+
+#Remove duplicate samples: keep FFT (as it is the most reliable group)
+duplicates <- paste(names(table(samples_data$patient))[table(samples_data$patient) == 2 & grepl("UPST", names(table(samples_data$patient)))], "-FIXT", sep = "")
+samples_data <- samples_data[-grep(paste(duplicates, collapse = "|"),rownames(samples_data)),]
+
+#Select samples with specific criteria 
+clinical_data_aPD1 <- clinical_data_raw %>% filter(Article_II== "Yes") %>%
+  filter(Rbiopsy_timepoint_stage %in% c("Metastatic", "Recurrence")) %>% 
+  filter(AntiPD1_timing != "PD1_previous_treatment") %>% 
+  filter(! (AntiPD1_timing == "PD1_last_treatment" & AntiPD1_timing_Rbiopsy_end_antiPD1 < -90))
+clinical_data_aPD1 <- clinical_data_aPD1[!grepl("IMMU-SCCHN1-1043|IMMU-SCCHN1-0266", rownames(clinical_data_aPD1)),]
+clinical_data_aPD1 <- clinical_data_aPD1[rownames(clinical_data_aPD1) %in% gsub("-F.*", "", rownames(samples_data)),]
+samples_data_aPD1 <- samples_data[samples_data$patient %in% rownames(clinical_data_aPD1),]
+#Select by hand a couple of patients At progression only
+samples_data_aPD1 <- samples_data_aPD1[!grepl("IMMU-SCCHN1-0767-FIXT-02|IMMU-SCCHN1-1319-FIXT-01", rownames(samples_data_aPD1)),]
+samples_data_aPD1 <- samples_data_aPD1[order(samples_data_aPD1$patient),]
+clinical_data_aPD1 <- clinical_data_aPD1[order(rownames(clinical_data_aPD1)),]
+clinical_data_aPD1[clinical_data_aPD1$AntiPD1_duration %in% 1, "AntiPD1_duration"] <- NA
+samples_data_aPD1$RNA_assay_library[is.na(samples_data_aPD1$RNA_assay_library)] <- "KAPA (HMR) + Globin Depletion (Roche)"
+clinical_data_aPD1$AntiPD1_resistance_si[rownames(clinical_data_aPD1) == "UPST-SCCHN3-0484"] <- "Primary_resistance"
+
+all_metadata <- cbind(clinical_data_aPD1, samples_data_aPD1)
+
+
+raw_counts <- raw_counts[, rownames(samples_data_aPD1)]
+counts_HUGO_norm <- as.data.frame(vst(as.matrix(raw_counts)))
+```
+
+Generate RNAseq features
+
+```{r}
+cytosig_scores <- as.data.frame(t(read.table("/home/daniel/IMMUCAN/cytosig_preds_full.Zscore", 
+                             header = TRUE, sep = "\t", check.names = FALSE)))
+colnames(cytosig_scores) <- paste(colnames(cytosig_scores), "_score", sep = "")
+cytosig_scores <- cytosig_scores[colnames(counts_HUGO_norm),]
+
+library(progeny)
+PathwayActivity_counts <- as.data.frame(progeny(as.matrix(counts_HUGO_norm), scale=FALSE, 
+                                  organism="Human", top = 500))
+colnames(PathwayActivity_counts) <- paste(colnames(PathwayActivity_counts), "_score", sep = "")
+
+library(ConsensusTME)
+results_constme_vst <- t(consensusTMEAnalysis(as.matrix(counts_HUGO_norm), 
+                                              cancer = "HNSC", statMethod = "ssgsea"))
+library(readxl)
+library(GSVA)
+hn_cafs_sigs <- read_xlsx(
+  "/home/daniel/IMMUCAN/Metadata_ClinicalData/Obradovic_HN_CAF_sigs.xlsx",
+  sheet = 2,
+  skip = 2
+)
+hn_cafs_sigs_comps <- sapply(unique(hn_cafs_sigs$cluster), function(x)
+  gsva(ssgseaParam(
+    as.matrix(counts_HUGO_norm), list(unlist(hn_cafs_sigs[hn_cafs_sigs$cluster == x &
+                                                            hn_cafs_sigs$p_val_adj < 1e-10, "gene"]))
+  ), verbose = FALSE))
+colnames(hn_cafs_sigs_comps) <- paste("HN_CAF_sig", seq(0, 4), sep = "_")
+rownames(hn_cafs_sigs_comps) <- colnames(counts_HUGO_norm)
+
+pan_caf_sigs <- read_xlsx(
+  "/home/daniel/IMMUCAN/Metadata_ClinicalData/Galbo_panCAF_sigs.xlsx",
+  sheet = 3,
+  skip = 1
+)
+pan_cafs_sigs_comps <- apply(pan_caf_sigs, 2, function(x)
+  gsva(ssgseaParam(as.matrix(counts_HUGO_norm), list(x)), verbose = FALSE))
+rownames(pan_cafs_sigs_comps) <- colnames(counts_HUGO_norm)
+emt_sigs <- read_xlsx("/home/daniel/IMMUCAN/Metadata_ClinicalData/Jung_EMT.xlsx", 
+                          sheet = 1)
+emt_sigs_comps <- apply(emt_sigs, 2, function(x) gsva(ssgseaParam(as.matrix(counts_HUGO_norm), 
+                                                               list(x)),
+                                                               verbose = FALSE))
+
+immuno_sigs <- read_xlsx("/home/daniel/IMMUCAN/Metadata_ClinicalData/signatures_gsva_PS_AVDE.xlsx")
+immuno_gsva <- as.data.frame(t(gsva(ssgseaParam(as.matrix(counts_HUGO_norm), as.list(immuno_sigs)),
+                                                         verbose = FALSE)))
+
+
+rnaseq_features <- cbind(cytosig_scores, PathwayActivity_counts, results_constme_vst,
+                         hn_cafs_sigs_comps, pan_cafs_sigs_comps, emt_sigs_comps, 
+                         immuno_gsva[, c("TGFB_Mariathasan", "ADO", "CYT", "TIS", "CAF_S1",
+                                         "APM_dou", "Exhausted")])
+
+rnaseq_features <- as.data.frame(scale(rnaseq_features))
+```
+
+## aPD1 treatment/resistance analyses
+
+Calculate differences between primary and secondary resistant patients
+
+```{r}
+prim_sec_lm_df <- cbind(rnaseq_features, all_metadata)
+prim_sec_lm_df <- prim_sec_lm_df[clinical_data_aPD1$AntiPD1_before_Rbiopsy == "Yes", ]
+
+prim_sec_pvalues <- sapply(colnames(rnaseq_features), function(y)
+  summary(
+    lm(
+      prim_sec_lm_df[, y] ~
+        AntiPD1_resistance_si +
+        specimen_type + samptype +
+        RNA_nucleic_acid_extraction +
+        RNA_assay_library,
+      data = prim_sec_lm_df
+    )
+  )$coefficients[2, 4])
+prim_sec_qvalues <- p.adjust(prim_sec_pvalues, 'BH')
+```
+
+Calculate differences between naive and secondary resistant patients
+
+```{r}
+naive_sec_lm_df <- cbind(rnaseq_features, all_metadata)
+naive_sec_lm_df <- naive_sec_lm_df[clinical_data_aPD1$AntiPD1_before_Rbiopsy == "No" |
+                                     (
+                                       clinical_data_aPD1$AntiPD1_before_Rbiopsy == "Yes" &
+                                         clinical_data_aPD1$AntiPD1_resistance_si == "Secondary_resistance"
+                                     ), ]
+
+naive_sec_pvalues <- sapply(colnames(rnaseq_features), function(y)
+  summary(
+    lm(
+      naive_sec_lm_df[, y] ~
+        AntiPD1_before_Rbiopsy +
+        specimen_type + samptype +
+        RNA_nucleic_acid_extraction +
+        RNA_assay_library,
+      data = naive_sec_lm_df
+    )
+  )$coefficients[2, 4])
+naive_sec_qvalues <- p.adjust(naive_sec_pvalues, 'BH')
+```
+
+```{r}
+#Figure 2A/B) Transcriptomic differences between aPD1 naive & treated, and between primary & secondary resistance
+test_results <- data.frame("X" = names(prim_sec_pvalues),
+                           "primary_vs_secondary" = prim_sec_pvalues,
+                           "naive_vs_secondary" = naive_sec_pvalues,
+                            row.names = 1:length(naive_sec_pvalues))
+test_results[,2:3] <- -log10(test_results[,2:3])
+#Comparing p-value and q-value, you can set the equivalence pval(0.05) = qval(0.02)
+test_results <- test_results[sapply(test_results[,3], function(x) any(x > -log10(0.02))),]
+test_results$X <- gsub("_", " ", test_results$X)
+test_df <- test_results %>% 
+  pivot_longer(!X, names_to = "Comparison")
+test_df %>% ggplot(aes(reorder(X, value, decreasing = TRUE),
+                       value, fill = Comparison)) + 
+  geom_bar(stat = "identity", position = position_dodge()) +
+  ylab("-log10(p-value)") + xlab("") + 
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  scale_fill_discrete(labels = c("naive_vs_secondary" = "Naive vs secondary resistance",
+                                 "primary_vs_secondary" = "Primary vs secondary resistance")) +
+  geom_hline(yintercept=1.9, linetype="dashed", 
+             color = "red", size=0.5) + 
+  theme_bw(base_size = 30, base_family = "Helvetica") +
+  theme(text = element_text(size = 18))
+
+clinical_data_aPD1$fig2_label <- clinical_data_aPD1$AntiPD1_before_Rbiopsy
+clinical_data_aPD1$fig2_label[clinical_data_aPD1$fig2_label == "No"] <- "Naive"
+clinical_data_aPD1$fig2_label[clinical_data_aPD1$AntiPD1_resistance_si == "Secondary_resistance" & !clinical_data_aPD1$fig2_label == "Naive"] <- "Secondary resistance"
+clinical_data_aPD1$fig2_label[clinical_data_aPD1$AntiPD1_resistance_si == "Primary_resistance" & !clinical_data_aPD1$fig2_label == "Naive"] <- "Primary resistance"
+rnaseq_features %>% 
+  ggplot(aes(clinical_data_aPD1$fig2_label, T_regulatory_cells,
+             color = clinical_data_aPD1$fig2_label)) +
+  geom_boxplot() + xlab("") + ylab("T regulatory cells (z-score)") +
+  theme_bw(base_size = 30, base_family = "Helvetica") +
+  theme(text = element_text(size = 18)) + 
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("#619CFF", "#fdae61", "#d7191c")) 
+```
+
+## WES-RNAseq analyses
+
+Calculate differences between MYC-altered and WT
+
+```{r}
+pathway_wes <- read.csv("/home/daniel/IMMUCAN/H&N/WES_tables/FinalFilesv2/HN_pathways_20240819.csv",
+                   sep = ";", row.names = 1)
+myc_rna_df <- cbind(rnaseq_features, all_metadata,
+                      pathway_wes[rownames(rnaseq_features),])
+
+myc_rna_pvalues <- sapply(colnames(rnaseq_features),
+                                     function(y) summary(lm(myc_rna_df[,y] ~ 
+                                                              MYC + 
+                                                              specimen_type +
+                                                              RNA_nucleic_acid_extraction + 
+                                                              RNA_assay_library,
+                                                          data = myc_rna_df))$coefficients[2,4])
+myc_rna_qvalues <- p.adjust(myc_rna_pvalues, 'BH')
+```
+
+```{r}
+#Figure 2A) Transcriptomic differences between MYC WT & altered
+test_results3 <- data.frame("X" = names(myc_rna_pvalues), "MYC" = myc_rna_pvalues)
+test_results3[, 2] <- -log10(test_results3[, 2])
+#Comparing p-value and q-value, you can set the equivalence pval(0.05) = qval(0.02)
+test_results3 <-  test_results3[test_results3[, 2] > -log10(0.02), ]
+test_results3$X <- gsub("_", " ", test_results3$X)
+test_df <- test_results3 %>%
+  pivot_longer(!X, names_to = "Comparison")
+test_df %>% ggplot(aes(reorder(X, value, decreasing = TRUE), value, fill = Comparison)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  ylab("-log10(p-value)") + xlab("") +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  scale_fill_manual(
+    values = c("deepskyblue2"),
+    labels = c("MYC" = "Lower in MYC pathway altered")
+  ) +
+  geom_hline(
+    yintercept = 1.9,
+    linetype = "dashed",
+    color = "red",
+    size = 0.5
+  ) +
+  theme_bw(base_size = 30, base_family = "Helvetica") +
+  theme(text = element_text(size = 18))
+```
